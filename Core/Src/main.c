@@ -59,16 +59,24 @@ UART_HandleTypeDef huart2;
 DMA_HandleTypeDef hdma_usart2_rx;
 
 /* USER CODE BEGIN PV */
-/* --- M6 --- */
-parser_t rx_parser;          /* tek ayristirici ornegi */
-uint16_t read_pos;           /* sadece tuketici yazar */
+/* --- M6: okuma konumu ve tuketim --- */
+parser_t rx_parser;          /* tek ayristirici; cagrilar arasi YASAMALI,
+                                yoksa sarimda bolunen paket kaybolur */
+uint16_t read_pos;           /* sadece rx_tuket yazar, DMA hic bakmaz */
 
-/* Uygulama seviyesi dogrulama */
-volatile uint16_t paket_sayaci;
-volatile uint16_t son_sira;
-volatile int16_t  son_x;
-volatile int16_t  son_y;
-volatile uint16_t sira_atlama;   /* beklenen sira gelmedi mi */
+/* Kesme set eder, while(1) temizler -> volatile ZORUNLU */
+volatile uint8_t yeni_veri_var;
+
+/* Uygulama seviyesi dogrulama. Bunlar main baglaminda yazilip okunuyor
+   (while(1) -> rx_tuket -> parser_besle -> paket_geldi), kesme icinde
+   degil. Bu yuzden volatile gerekmiyor. */
+uint16_t paket_sayaci;
+uint16_t son_sira;
+int16_t  son_x;
+int16_t  son_y;
+uint16_t sira_atlama;        /* beklenen SEQUENCE gelmedigi olay sayisi */
+uint16_t beklenen_sira;      /* bir sonraki paketten beklenen SEQUENCE */
+uint8_t  sira_baslatildi;    /* ilk paket referans alindi mi */
 
 
 /* --- M5: DMA alim altyapisi --- */
@@ -127,7 +135,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  uint16_t sira;               /* T2 sarim testinin dongu sayaci */
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -152,6 +160,10 @@ int main(void)
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
   testleri_kosur();
+  /* Ayristirici ve okuma konumu, alim baslamadan once temiz olmali */
+  parser_sifirla(&rx_parser);
+  read_pos = 0U;
+
   /* RX'i TX'ten ONCE baslat: loopback'te gonderilen baytlar hemen geri doner,
      alim hazir degilse kaybolurlar. */
   if (HAL_UARTEx_ReceiveToIdle_DMA(&huart2, RxData, sizeof(RxData)) != HAL_OK)
@@ -175,6 +187,34 @@ int main(void)
   if (HAL_UART_Transmit(&huart2, TxData, tx_boyu, 100U) != HAL_OK)
   {
     Error_Handler();
+  }
+
+  /* T1: tek paketi tuket */
+  rx_tuket();
+
+  /* T2 - sarim testi: SEQUENCE 2..40 ile 39 paket daha.
+     Toplam 40 paket x 13 bayt = 520 bayt; tampon 256 bayt oldugundan
+     sarim iki kez gerceklesir.
+
+     Her gonderimden sonra tuketmek ZORUNLU. Tuketmezsen yaklasik 20.
+     pakette DMA okunmamis veriyi ezmeye baslar ve konumlar esit gorunerek
+     kaybi gizler. Bu davranisi gormek istersen asagidaki rx_tuket()
+     cagrisini gecici olarak yorum satiri yap. */
+  for (sira = 2U; sira <= 40U; sira++)
+  {
+    tx_boyu = paket_joystick_olustur(TxData, (uint8_t)sizeof(TxData),
+                                     1000, -500, sira);
+    if (tx_boyu == 0U)
+    {
+      Error_Handler();
+    }
+
+    if (HAL_UART_Transmit(&huart2, TxData, tx_boyu, 100U) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    rx_tuket();
   }
   /* USER CODE END 2 */
 
@@ -315,6 +355,10 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     count++;
     son_size = Size;
 
+    /* Tuketiciyi uyandir. Size'i tuketim icin KULLANMIYORUZ: mutlak konum
+       bildirir, "kac yeni bayt" degil. Konumu rx_tuket kendisi hesaplar. */
+    yeni_veri_var = 1U;
+
     /* Hangi olay tetikledi? M5'te sadece dogrulama icin ayiriyoruz. */
     switch (HAL_UARTEx_GetRxEventType(huart))
     {
@@ -346,46 +390,89 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 }
 
 
-/* Dogrulanmis paket geldiginde cagrilir */
+/* Dogrulanmis bir paket cozuldugunde parser_besle tarafindan cagrilir.
+   main baglaminda calisir: while(1) -> rx_tuket -> parser_besle -> buraya.
+   paket->payload YALNIZCA bu cagri suresince gecerli; saklanacaksa kopyalanmali. */
 static void paket_geldi(const paket_bilgi_t *paket, void *kullanici)
 {
     (void)kullanici;
 
     paket_sayaci++;
 
-    /* TODO: sira numarasi beklenenden farkliysa sira_atlama++
-             son_sira'yi guncelle */
+    if (sira_baslatildi == 0U)
+    {
+        /* Ilk paket: gonderenin hangi degerden basladigini bilemeyiz.
+           Karsilastirma yapmadan referans aliyoruz. */
+        sira_baslatildi = 1U;
+    }
+    else if (paket->sira != beklenen_sira)
+    {
+        sira_atlama++;
+    }
+    else
+    {
+        /* Beklenen sira geldi */
+    }
+
+    son_sira = paket->sira;
+
+    /* Beklentiyi GELEN degerden turetiyoruz. "beklenen_sira++" yazsaydik tek
+       bir kayiptan sonra kalici olarak bir geri kalir ve sonraki her paketi
+       kayip sayardik. Boylece kayip bir kez raporlanip senkron geri geliyor.
+       (uint16_t) cast'i 65535 -> 0 sarimini kendiliginden hallediyor. */
+    beklenen_sira = (uint16_t)(paket->sira + 1U);
 
     if ((paket->tur == PAKET_TUR_JOYSTICK) && (paket->uzunluk == 4U))
     {
-        /* TODO: payload'dan X ve Y'yi coz (M0.5'teki birlestirme) */
+        son_x = (int16_t)((uint16_t)paket->payload[0] |
+                         ((uint16_t)paket->payload[1] << 8));
+        son_y = (int16_t)((uint16_t)paket->payload[2] |
+                         ((uint16_t)paket->payload[3] << 8));
     }
 }
 
-/* DMA tamponundaki yeni baytlari ayristiriciya verir */
+/* DMA tamponundaki yeni baytlari ayristiriciya verir.
+   Isi: dairesel tamponu, parser_besle'nin bekledigi ARDISIK bayt
+   araliklarina cevirmek. parser.c dairesel tampon nedir bilmez. */
 static void rx_tuket(void)
 {
-    uint16_t boyut = (uint16_t)sizeof(RxData);
+    const uint16_t boyut = (uint16_t)sizeof(RxData);
     uint16_t write_pos;
+    uint16_t adet;
 
     for (;;)
     {
-        /* TODO: write_pos'u NDTR'den hesapla */
+        /* NDTR kalan transfer sayisini tutar ve her baytta azalir:
+              yazilan bayt sayisi = boyut - NDTR
+           Modulo tek bir uc durum icin gerekli: DMA 256. bayti yazip NDTR'yi
+           henuz yeniden yuklemediginde 0 okunur, boyut - 0 = 256 cikar ve bu
+           gecersiz bir indekstir. Modulo onu 0'a cevirir. */
+        write_pos = (uint16_t)((boyut - (uint16_t)__HAL_DMA_GET_COUNTER(&hdma_usart2_rx))
+                               % boyut);
 
         if (write_pos == read_pos)
         {
-            break;                     /* yeni veri yok */
+            /* Yeni veri yok.
+               DIKKAT: tam bir tur uzerine yazilmis olsa da konumlar boyle
+               gorunur. Modulo aritmetigi tasmayi tespit edemez; koruma
+               zamaninda tuketmektir. */
+            break;
         }
 
         if (write_pos > read_pos)
         {
-            /* TODO: read_pos'tan write_pos'a kadar besle, read_pos'u guncelle */
+            /* Sarim yok: tek ardisik aralik */
+            adet = (uint16_t)(write_pos - read_pos);
+            parser_besle(&rx_parser, &RxData[read_pos], adet, paket_geldi, NULL);
+            read_pos = write_pos;
         }
         else
         {
-            /* TODO: read_pos'tan tampon SONUNA kadar besle,
-                     read_pos'u 0 yap. Kalan kismi dongunun
-                     sonraki turu halledecek. */
+            /* Sarim var: once tampon SONUNA kadar besle. Kalani dongunun
+               sonraki turu artik "sarim yok" durumu olarak halleder. */
+            adet = (uint16_t)(boyut - read_pos);
+            parser_besle(&rx_parser, &RxData[read_pos], adet, paket_geldi, NULL);
+            read_pos = 0U;
         }
     }
 }
