@@ -29,7 +29,7 @@ DMA1 Stream5          DR'den RxData[] içine yazar (circular), CPU karışmaz
                               ↓
 RxData[256]           ham bayt akışı, dairesel tampon
                               ↓
-rx_tuket()            read_pos/write_pos ile ardışık aralıkları çıkarır
+uart_rx_tuket()       read_pos/write_pos ile ardışık aralıkları çıkarır
                               ↓
 parser_besle()        sınır bulur, VERSION/LENGTH/CRC doğrular
                               ↓
@@ -100,11 +100,28 @@ TYPE 0x20, payload {AA,55}, SEQ=300     →  11 bayt, CRC 0x8F8D
 | `Core/Src/crc16.c` | CRC-16/CCITT-FALSE hesabı | yok (saf C) |
 | `Core/Src/packet.c` | Paket **oluşturma** (gönderme yönü) | `crc16` |
 | `Core/Src/parser.c` | Paket **ayrıştırma** (alma yönü) | `crc16`, `packet.h` (sabitler) |
-| `Core/Src/main.c` | Donanım kurulumu, tüketim, uygulama | HAL, yukarıdakiler |
+| `Core/Src/uart_rx.c` | DMA tamponu, okuma konumu, HAL callback'leri, uygulama durumu | HAL, `parser`, `packet` |
+| `Core/Src/tests.c` | 27 birim testi + loopback testi | tümü |
+| `Core/Src/main.c` | Yalnızca CubeMX kurulumu + `uart_rx_baslat` / `uart_rx_isle` | `uart_rx`, `tests` |
 | `tools/protokol.py` | Bağımsız referans uygulaması | Python 3 |
 
 `packet.c` ve `parser.c` birbirinin tersidir: biri veriden bayt üretir, diğeri
 baytlardan veri çıkarır.
+
+`uart_rx.c` alım altyapısının tek sahibidir. Tampon, okuma konumu ve ayrıştırıcı
+örneği dosya kapsamında `static`'tir (`s_` önekiyle); dışarıya yalnızca üç
+fonksiyon ve iki salt-okuma yapı açılır:
+
+```c
+HAL_StatusTypeDef uart_rx_baslat(UART_HandleTypeDef *huart);
+void              uart_rx_isle(void);    /* bildirim varsa tüket */
+void              uart_rx_tuket(void);   /* koşulsuz tüket */
+extern uart_rx_istatistik_t uart_rx_ist;     /* kesme olayları */
+extern uart_rx_durum_t      uart_rx_durum;   /* joystick + sıra durumu */
+```
+
+`tests.c` üretim kodunun bağımlılığı **değildir**: `main.c`'deki iki çağrıyı
+(`birim_testleri_kosur`, `loopback_testi_kosur`) kaldırmak yeterlidir.
 
 ### Arayüzler
 
@@ -235,7 +252,7 @@ ezilmeden tüketilmesi hedeflenirse bütçe ~11 ms olur.
 
 ### 5.7 Sarımda iki aralık, tek kod yolu
 
-Sarım olduğunda yeni baytlar bellekte ardışık değildir. `rx_tuket` her turda
+Sarım olduğunda yeni baytlar bellekte ardışık değildir. `uart_rx_tuket` her turda
 **tek** ardışık aralık tüketir:
 
 - Sarım yoksa: `read_pos … write_pos-1`, sonra `read_pos = write_pos`
@@ -249,7 +266,7 @@ kaybolmaz — M4'teki S2 senaryosunun aynısıdır.
 
 ### 5.8 `rx_parser` çağrılar arasında yaşamalıdır
 
-`rx_tuket` içinde yerel tanımlanırsa her çağrıda sıfırlanır ve yarım paketler
+`uart_rx_tuket` içinde yerel tanımlanırsa her çağrıda sıfırlanır ve yarım paketler
 kaybolur. Sarımda önce 6 bayt, sonra 14 bayt beslenir; ayrıştırıcının ilk 6
 baytı hatırlaması zorunludur.
 
@@ -277,8 +294,8 @@ bellekten oku" der. **Atomiklik sağlamaz.**
 | `yeni_veri_var`, `count`, `idle_sayaci`, `errorcount`, `son_size`, `son_hata_kodu` | evet | Kesme yazar, main okur — iki farklı çalışma bağlamı |
 | `paket_sayaci`, `son_sira`, `son_x`, `son_y`, `sira_atlama`, `read_pos` | hayır | Yalnızca main bağlamında yazılıp okunur |
 
-`paket_geldi` bir kesme içinde çalışmaz: `while(1) → rx_tuket → parser_besle →
-paket_geldi` zinciri main bağlamındadır.
+`paket_geldi` bir kesme içinde çalışmaz: `while(1) → uart_rx_isle → uart_rx_tuket →
+parser_besle → paket_geldi` zinciri main bağlamındadır.
 
 `volatile`'ın çözmediği şeyler: `sayac++` üç işlemdir (oku, artır, yaz) ve
 bölünebilir; iki ayrı değişken birlikte tutarlı okunamaz. İki bağlam da aynı
@@ -381,7 +398,7 @@ değil.
 
 ### Doğrulanmamış olanlar
 
-- **Kesme güdümlü tüketim yolu sınanmadı.** T2 testinde `rx_tuket()` gönderim
+- **Kesme güdümlü tüketim yolu sınanmadı.** T2 testinde `uart_rx_tuket()` gönderim
   döngüsü içinden **eşzamanlı** çağrılıyor; 40 paketi teslim eden yol bu.
   `while(1)` içindeki `yeni_veri_var` yolunun bağlı olduğu doğrulandı (IDLE
   tetikleniyor, bayrak kalkıyor) ama testin sonucu ona dayanmıyor.
