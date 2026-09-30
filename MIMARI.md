@@ -361,15 +361,30 @@ okunur (`Live Expressions`).
 
 ### Donanım doğrulamaları
 
-| Ne | Nasıl | Durum |
+PA2–PA3 loopback, STM32F4DISCOVERY, ST-LINK üzerinden GDB ile okundu
+(30 Eylül 2026).
+
+| Ne | Ölçüm | Durum |
 |---|---|---|
-| IDLE zinciri | Loopback, `idle_sayaci` artıyor | Doğrulandı |
-| DMA yazımı | `*RxData@13` beklenen baytlara eşit | Doğrulandı |
-| Uçtan uca alım | 1 paket → `son_x=1000`, `son_y=-500` | M6, doğrulama bekliyor |
-| Sarım | 40 paket / 520 bayt → `paket_sayaci=40`, `sira_atlama=0` | M6, doğrulama bekliyor |
+| Birim testleri | `test_gecen=27`, `test_kalan=0` | Doğrulandı |
+| DMA yazımı | `RxData` beklenen baytları taşıyor | Doğrulandı |
+| Uçtan uca alım | `son_x=1000`, `son_y=-500` | Doğrulandı |
+| Sarım | 40 paket / 520 bayt → `paket_sayaci=40`, `son_sira=40`, `sira_atlama=0` | Doğrulandı |
+| Okuma konumu | `read_pos=8` (520 mod 256) | Doğrulandı |
+| Ayrıştırıcı temizliği | `crc_hata=0`, `atilan_bayt=0`, `yazilan=0` | Doğrulandı |
+| HT/TC olayları | `ht_sayaci=2`, `tc_sayaci=2` (520 bayt için beklenen) | Doğrulandı |
+| IDLE olayı | `idle_sayaci=1`, `son_size=8` | Doğrulandı |
+
+`son_size=8` ölçümü, 5.3'teki tespitin doğrudan kanıtıdır: 520 bayt alınmış
+olmasına rağmen `Size` **mutlak konumu** (8) bildiriyor, gelen bayt sayısını
+değil.
 
 ### Doğrulanmamış olanlar
 
+- **Kesme güdümlü tüketim yolu sınanmadı.** T2 testinde `rx_tuket()` gönderim
+  döngüsü içinden **eşzamanlı** çağrılıyor; 40 paketi teslim eden yol bu.
+  `while(1)` içindeki `yeni_veri_var` yolunun bağlı olduğu doğrulandı (IDLE
+  tetikleniyor, bayrak kalkıyor) ama testin sonucu ona dayanmıyor.
 - Sürekli tam hızlı trafik altında en kötü gecikme **ölçülmedi**
 - Kayıpsızlık iddia **edilemez**: taşma tespiti yok (bkz. 5.6)
 - PC'den gerçek veri ile test edilmedi; yalnızca loopback

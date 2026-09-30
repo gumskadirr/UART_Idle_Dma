@@ -118,6 +118,8 @@ static void paket_testleri_kosur(void);
 static void paket_toplayici(const paket_bilgi_t *paket, void *kullanici);
 static void parser_testleri_kosur(void);
 static void testleri_kosur(void);
+static void paket_geldi(const paket_bilgi_t *paket, void *kullanici);
+static void rx_tuket(void);
 
 
 /* USER CODE END PFP */
