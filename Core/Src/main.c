@@ -99,7 +99,7 @@ int main(void)
 
   /* Alimi baslat: ayristirici ve okuma konumu sifirlanir, circular DMA
      IDLE olaylariyla kurulur. Loopback gonderiminden ONCE olmali. */
-  if (uart_rx_baslat(&huart2) != HAL_OK)
+  if (uart_rx_start(&huart2) != HAL_OK)
   {
     Error_Handler();
   }
@@ -115,7 +115,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    uart_rx_isle();
+    uart_rx_service();
   }
   /* USER CODE END 3 */
 }

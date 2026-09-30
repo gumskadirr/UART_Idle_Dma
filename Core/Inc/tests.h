@@ -32,8 +32,8 @@ void birim_testleri_kosur(void);
 
 /* Loopback testi: PA2-PA3 arasi jumper kablo gerektirir.
    40 joystick paketi gonderir (520 bayt), 256 baytlik tamponda sarim iki kez
-   gerceklesir. Sonuclar uart_rx_durum uzerinden okunur.
-   ONKOSUL: uart_rx_baslat() cagrilmis olmali. */
+   gerceklesir. Sonuclar uart_rx_state uzerinden okunur.
+   ONKOSUL: uart_rx_start() cagrilmis olmali. */
 void loopback_testi_kosur(UART_HandleTypeDef *huart);
 
 #endif /* INC_TESTS_H_ */

@@ -1,47 +1,52 @@
 /*
  * parser.h
  *
- * UART bayt akisindan dogrulanmis paket cikarma.
- * Bu modul HAL, DMA ve FreeRTOS'tan bagimsizdir: bayt alir, paket verir.
+ * UART bayt akisindan dogrulanmis cerceve cikarma.
+ * Bu modul HAL, DMA ve FreeRTOS'tan bagimsizdir: bayt alir, cerceve verir.
  */
 
 #ifndef INC_PARSER_H_
 #define INC_PARSER_H_
 
 #include <stdint.h>
-#include "packet.h"
+#include "frame.h"
 
-/* Cozulmus paketin bilgileri.
-   DIKKAT: payload isaretcisi yalnizca geri cagri suresince gecerlidir.
-   Veriyi saklayacaksan kopyala; ayristirici tamponu sonra degisir. */
+/* Cozulmus cercevenin alanlari.
+   DIKKAT: payload isaretcisi yalnizca handler cagrisi suresince gecerlidir.
+   Veriyi saklayacaksan kopyala; ayristirici tamponu sonra degisir.
+   Bu yapi veriyi SAHIPLENMEZ, yalnizca tarif eder. */
 typedef struct
 {
-    uint8_t        tur;
-    uint16_t       sira;
-    uint8_t        uzunluk;
-    const uint8_t *payload;    /* uzunluk 0 ise NULL */
-} paket_bilgi_t;
+    uint8_t        type;
+    uint16_t       seq;
+    uint8_t        payload_len;
+    const uint8_t *payload;      /* payload_len 0 ise NULL */
+} frame_info_t;
 
-/* Gecerli paket bulununca cagrilir.
-   kullanici: cagirana ait serbest isaretci, ayristirici icine bakmaz. */
-typedef void (*paket_geri_cagri_t)(const paket_bilgi_t *paket, void *kullanici);
+/* Gecerli cerceve bulununca cagrilir.
+   user_data: cagirana ait serbest isaretci; ayristirici icine bakmaz. */
+typedef void (*frame_handler_t)(const frame_info_t *info, void *user_data);
 
 typedef struct
 {
-    uint8_t  tampon[PAKET_MAX_BOYUT];   /* aday paket penceresi */
-    uint8_t  yazilan;                   /* tamponda kac bayt var */
+    uint8_t  buf[FRAME_MAX_SIZE];   /* aday cerceve penceresi */
+    uint8_t  len;                   /* buf icindeki gecerli bayt sayisi */
 
-    uint16_t sayac_gecerli;
-    uint16_t sayac_crc_hata;
-    uint16_t sayac_uzunluk_hata;
-    uint16_t sayac_surum_hata;
-    uint16_t sayac_atilan_bayt;
-} parser_t;
+    uint16_t frames_ok;             /* dogrulanmis cerceve sayisi */
+    uint16_t err_crc;               /* CRC uyusmadi */
+    uint16_t err_len;               /* LENGTH sinir disi */
+    uint16_t err_version;           /* VERSION uyusmadi */
+    uint16_t bytes_dropped;         /* yeniden tarama sirasinda atilan bayt */
+} frame_parser_t;
 
-void parser_sifirla(parser_t *p);
+/* Yapiyi ilk kullanima hazirlar: len ve butun sayaclar sifirlanir.
+   buf icerigi temizlenmez; len == 0 oldugu icin okunmaz. */
+void frame_parser_init(frame_parser_t *p);
 
-void parser_besle(parser_t *p,
-                  const uint8_t *veri, uint16_t uzunluk,
-                  paket_geri_cagri_t geri_cagri, void *kullanici);
+/* Gelen baytlari isler. Bir cagride sifir, bir veya birden fazla cerceve
+   bulunabilir; her biri icin handler cagrilir. */
+void frame_parser_feed(frame_parser_t *p,
+                       const uint8_t *data, uint16_t len,
+                       frame_handler_t handler, void *user_data);
 
 #endif /* INC_PARSER_H_ */

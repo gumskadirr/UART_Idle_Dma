@@ -13,10 +13,10 @@
 /**
   * @brief  CRC-16/IBM-3740 (CRC-16/CCITT-FALSE) hesaplar.
   *         Polinom 0x1021, baslangic 0xFFFF, yansitma yok, cikis XOR yok.
-  * @param  veri     Hesaba katilacak baytlar. Fonksiyon veriyi degistirmez.
-  * @param  uzunluk  veri icindeki bayt sayisi. 0 olabilir.
-  * @retval Hesaplanan CRC. uzunluk 0 veya veri NULL ise 0xFFFF doner.
+  * @param  data     Hesaba katilacak baytlar. Fonksiyon veriyi degistirmez.
+  * @param  len      data icindeki bayt sayisi. 0 olabilir.
+  * @retval Hesaplanan CRC. len 0 veya data NULL ise 0xFFFF doner.
   */
-uint16_t crc16_ccitt(const uint8_t *veri, uint16_t uzunluk);
+uint16_t crc16_ccitt(const uint8_t *data, uint16_t len);
 
 #endif /* INC_CRC16_H_ */

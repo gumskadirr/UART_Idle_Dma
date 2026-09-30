@@ -2,9 +2,12 @@
  * parser.c
  *
  * Kayan aday penceresi yaklasimi:
- *   gelen her bayti tamponun sonuna ekle, sonra tamponun BASINDAN
- *   paket cozmeyi dene. Cozulemezse SADECE BIR BAYT at ve tekrar dene.
- *   Bir bayt atmak, arkadaki gercek paketin kaybolmamasini saglar.
+ *   gelen her bayti tamponun sonuna ekle, sonra tamponun BASINDAN cerceve
+ *   cozmeyi dene. Cozulemezse SADECE BIR BAYT at ve tekrar dene.
+ *
+ * Cekirdek karar: hicbir bayt "islendi" diye atilmaz, yalnizca kanitlandiginda
+ * atilir. Bir bayt atmak, bozuk adayin ICINDE baslayan gercek bir cercevenin
+ * kaybolmamasini saglar.
  */
 #include <stddef.h>
 #include <string.h>
@@ -14,191 +17,191 @@
 /* Cozme denemesinin sonucu */
 typedef enum
 {
-    COZ_EKSIK = 0,   /* karar icin yeterli bayt yok, bekle */
-    COZ_TAMAM,       /* tamponun basinda gecerli paket var */
-    COZ_HATALI       /* bu aday paket degil, bir bayt ilerle */
-} coz_sonuc_t;
+    PARSE_NEED_MORE = 0,   /* karar icin yeterli bayt yok, bekle */
+    PARSE_OK,              /* tamponun basinda gecerli cerceve var */
+    PARSE_INVALID          /* bu aday cerceve degil, bir bayt ilerle */
+} parse_result_t;
 
 
-void parser_sifirla(parser_t *p)
+void frame_parser_init(frame_parser_t *p)
 {
-    /* TODO: p NULL ise hicbir sey yapma.
-             yazilan ve butun sayaclari sifirla.
-             tampon icerigini temizlemek gerekmiyor - neden? */
-	if (p == NULL){
-		return;
-	}
-	else{
-		p->yazilan =              0;
-		p->sayac_atilan_bayt =    0;
-		p->sayac_crc_hata =       0;
-		p->sayac_gecerli =        0;
-		p->sayac_surum_hata =     0;
-		p->sayac_uzunluk_hata =   0;
-	}
-}
-
-
-/* Tamponun basindan n bayt siler, kalan baytlari basa kaydirir. */
-static void tampondan_sil(parser_t *p, uint8_t n)
-{
-    /* TODO:
-       - n, yazilan'dan buyukse yazilan kadar sil
-       - kalan bayt varsa &p->tampon[n] adresinden p->tampon adresine tasi
-         Ipucu: memmove(hedef, kaynak, adet)
-         memcpy DEGIL: kaynak ve hedef ust uste biniyor, memcpy'de
-         bu durumun davranisi tanimsiz.
-       - yazilan'i guncelle */
-	if (p==NULL){
-		return;
-	}
-	if (n >= p->yazilan){
-		memmove(&p->tampon[0],&p->tampon[p->yazilan], n - p->yazilan);
-		p->yazilan = 0;
-	}
-	else if(p->yazilan >= n){
-		memmove(&p->tampon[0], &p->tampon[n],p->yazilan -n);
-		p->yazilan = p->yazilan -n;
-	}
-
-}
-
-
-/* Tamponun basindan bir paket cozmeyi dener.
-   COZ_TAMAM donerse *paket_boyu toplam paket boyutunu tasir.
-   Hatali adaylarda ilgili sayaci artirir.
-
-   DIKKAT: yazilan == 0 iken COZ_HATALI DONME. Donersen parser_besle
-   icindeki dongu hicbir bayt silemez ve sonsuza kadar doner. */
-static coz_sonuc_t coz_dene(parser_t *p, uint8_t *paket_boyu)
-{
-	/* Kontrol sirasi (her adim oncekilerin gectigini varsayabilir):
-
-	       1.  yazilan < 1                    -> COZ_EKSIK
-	       2.  tampon[0] != PAKET_BAS1        -> COZ_HATALI
-	       3.  yazilan < 2                    -> COZ_EKSIK
-	       4.  tampon[1] != PAKET_BAS2        -> COZ_HATALI
-	       5.  yazilan < 7 (baslik tam degil) -> COZ_EKSIK
-	       6.  tampon[2] != PAKET_SURUM       -> sayac_surum_hata++,   COZ_HATALI
-	       7.  tampon[4] > PAKET_MAX_PAYLOAD  -> sayac_uzunluk_hata++, COZ_HATALI
-	       8.  toplam = PAKET_EK_BOYU + tampon[4]
-	           yazilan < toplam               -> COZ_EKSIK
-	       9.  gelen CRC = tampon[toplam-2] | (tampon[toplam-1] << 8)
-	           hesap CRC = crc16_ccitt(&tampon[2], toplam - 4)
-	           esit degilse                   -> sayac_crc_hata++,     COZ_HATALI
-	       10. *paket_boyu = toplam           -> COZ_TAMAM
-
-	       9. adimdaki "toplam - 4" nereden geliyor? Kagida bir paket ciz:
-	       CRC indeks 2'den baslar ve CRC alaninin hemen oncesinde biter. */
-    uint16_t toplam;
-    uint16_t gelen_crc;
-    uint16_t hesap_crc;
-
-    if (p->yazilan < 1U){
-        return COZ_EKSIK;
-    }
-    if (p->tampon[0] != PAKET_BAS1){
-        return COZ_HATALI;
-    }
-    if (p->yazilan < 2U){
-        return COZ_EKSIK;
-    }
-    if (p->tampon[1] != PAKET_BAS2){
-        return COZ_HATALI;
-    }
-    if (p->yazilan < 7U){                    /* baslik henuz tam degil */
-        return COZ_EKSIK;
-    }
-    if (p->tampon[2] != PAKET_SURUM){
-        p->sayac_surum_hata++;
-        return COZ_HATALI;
-    }
-    if (p->tampon[4] > PAKET_MAX_PAYLOAD){
-        p->sayac_uzunluk_hata++;
-        return COZ_HATALI;
-    }
-
-    /* LENGTH dogrulandi: artik toplam boyut guvenle hesaplanabilir */
-    toplam = (uint16_t)PAKET_EK_BOYU + (uint16_t)p->tampon[4];
-
-    if ((uint16_t)p->yazilan < toplam) {
-        return COZ_EKSIK;
-    }
-
-    gelen_crc = (uint16_t)p->tampon[toplam - 2U] |
-                ((uint16_t)p->tampon[toplam - 1U] << 8);
-    hesap_crc = crc16_ccitt(&p->tampon[2], (uint16_t)(toplam - 4U));
-
-    if (gelen_crc != hesap_crc){
-        p->sayac_crc_hata++;
-        return COZ_HATALI;
-    }
-
-    *paket_boyu = (uint8_t)toplam;
-    return COZ_TAMAM;
-}
-
-void parser_besle(parser_t *p,
-                  const uint8_t *veri, uint16_t uzunluk,
-                  paket_geri_cagri_t geri_cagri, void *kullanici)
-{
-    uint16_t    i;
-    uint8_t     paket_boyu;
-    coz_sonuc_t sonuc;
-
-    if ((p == NULL) || ((veri == NULL) && (uzunluk > 0U)))
+    if (p == NULL)
     {
         return;
     }
 
-    for (i = 0U; i < uzunluk; i++)
+    p->len           = 0U;
+    p->frames_ok     = 0U;
+    p->err_crc       = 0U;
+    p->err_len       = 0U;
+    p->err_version   = 0U;
+    p->bytes_dropped = 0U;
+}
+
+
+/* Tamponun basindan n bayt cikarir, kalan baytlari basa kaydirir. */
+static void buf_consume(frame_parser_t *p, uint8_t n)
+{
+    uint8_t remaining;
+
+    if (n >= p->len)
+    {
+        /* Hepsi cikiyor: tasinacak bayt yok */
+        p->len = 0U;
+    }
+    else
+    {
+        remaining = (uint8_t)(p->len - n);
+
+        /* memmove, memcpy DEGIL: kaynak ve hedef ust uste biniyor ve
+           memcpy'de bu durumun davranisi tanimsizdir. */
+        memmove(&p->buf[0], &p->buf[n], remaining);
+
+        p->len = remaining;
+    }
+}
+
+
+/* Tamponun basindan bir cerceve cozmeyi dener.
+   PARSE_OK donerse *out_frame_len toplam cerceve boyutunu tasir.
+   Gecersiz adaylarda ilgili hata sayacini artirir.
+
+   Kontrol sirasi veri bagimliligiyla zorunludur: CRC icin butun cerceve,
+   toplam boyut icin LENGTH, LENGTH'e guvenmek icin SYNC ve VERSION gerekir.
+
+   DIKKAT: len == 0 iken PARSE_INVALID DONULMEZ. Donulurse frame_parser_feed
+   icindeki dongu hicbir bayt cikaramaz ve sonsuza kadar doner. */
+static parse_result_t try_parse_frame(frame_parser_t *p, uint8_t *out_frame_len)
+{
+    uint16_t total_len;
+    uint16_t crc_received;
+    uint16_t crc_computed;
+
+    if (p->len < 1U)
+    {
+        return PARSE_NEED_MORE;
+    }
+    if (p->buf[FRAME_OFF_SYNC0] != FRAME_SYNC0)
+    {
+        return PARSE_INVALID;
+    }
+    if (p->len < 2U)
+    {
+        return PARSE_NEED_MORE;
+    }
+    if (p->buf[FRAME_OFF_SYNC1] != FRAME_SYNC1)
+    {
+        return PARSE_INVALID;
+    }
+    if (p->len < FRAME_HEADER_SIZE)
+    {
+        return PARSE_NEED_MORE;             /* baslik henuz tam degil */
+    }
+    if (p->buf[FRAME_OFF_VERSION] != PROTOCOL_VERSION)
+    {
+        p->err_version++;
+        return PARSE_INVALID;
+    }
+    if (p->buf[FRAME_OFF_LENGTH] > FRAME_MAX_PAYLOAD)
+    {
+        p->err_len++;
+        return PARSE_INVALID;
+    }
+
+    /* LENGTH dogrulandi: toplam boyut artik guvenle hesaplanabilir */
+    total_len = (uint16_t)FRAME_OVERHEAD + (uint16_t)p->buf[FRAME_OFF_LENGTH];
+
+    if ((uint16_t)p->len < total_len)
+    {
+        return PARSE_NEED_MORE;
+    }
+
+    /* CRC alani cercevenin son iki bayti, little-endian */
+    crc_received = (uint16_t)p->buf[total_len - FRAME_CRC_SIZE] |
+                   ((uint16_t)p->buf[total_len - FRAME_CRC_SIZE + 1U] << 8);
+
+    /* CRC, VERSION alanindan payload sonuna kadar hesaplanir: senkron
+       baytlari ve CRC alaninin kendisi haric. */
+    crc_computed = crc16_ccitt(&p->buf[FRAME_OFF_VERSION],
+                               (uint16_t)(total_len - FRAME_OFF_VERSION
+                                                    - FRAME_CRC_SIZE));
+
+    if (crc_received != crc_computed)
+    {
+        p->err_crc++;
+        return PARSE_INVALID;
+    }
+
+    *out_frame_len = (uint8_t)total_len;
+    return PARSE_OK;
+}
+
+
+void frame_parser_feed(frame_parser_t *p,
+                       const uint8_t *data, uint16_t len,
+                       frame_handler_t handler, void *user_data)
+{
+    uint16_t       i;
+    uint8_t        frame_len;
+    parse_result_t result;
+
+    if ((p == NULL) || ((data == NULL) && (len > 0U)))
+    {
+        return;
+    }
+
+    for (i = 0U; i < len; i++)
     {
         /* Guvenlik: tampon doluysa en eski bayti at. Dogru calisan bir
-           coz_dene ile buraya normalde hic girilmez. */
-        if (p->yazilan >= (uint8_t)sizeof(p->tampon))
+           try_parse_frame ile buraya normalde hic girilmez. */
+        if (p->len >= (uint8_t)sizeof(p->buf))
         {
-            tampondan_sil(p, 1U);
-            p->sayac_atilan_bayt++;
+            buf_consume(p, 1U);
+            p->bytes_dropped++;
         }
 
-        p->tampon[p->yazilan] = veri[i];
-        p->yazilan++;
+        p->buf[p->len] = data[i];
+        p->len++;
 
-        /* Yeni bayt geldi: cozebildigimiz kadar coz */
+        /* Yeni bayt geldi: cozebildigimiz kadar coz. Dongu gerekli, cunku bir
+           PARSE_INVALID zincirleme tetiklenebilir: bir bayt cikarinca yeni
+           aday hemen yeni bir karar uretebilir, yeni veri beklemeden. */
         for (;;)
         {
-            paket_boyu = 0U;
-            sonuc = coz_dene(p, &paket_boyu);
+            frame_len = 0U;
+            result = try_parse_frame(p, &frame_len);
 
-            if (sonuc == COZ_EKSIK)
+            if (result == PARSE_NEED_MORE)
             {
-                break;                        /* daha fazla bayt lazim */
+                break;
             }
 
-            if (sonuc == COZ_TAMAM)
+            if (result == PARSE_OK)
             {
-                paket_bilgi_t bilgi;
+                frame_info_t info;
 
-                p->sayac_gecerli++;
+                p->frames_ok++;
 
-                bilgi.tur     = p->tampon[3];
-                bilgi.uzunluk = p->tampon[4];
-                bilgi.sira    = (uint16_t)p->tampon[5] |
-                                ((uint16_t)p->tampon[6] << 8);
-                bilgi.payload = (bilgi.uzunluk > 0U) ? &p->tampon[7] : NULL;
+                info.type        = p->buf[FRAME_OFF_TYPE];
+                info.payload_len = p->buf[FRAME_OFF_LENGTH];
+                info.seq         = (uint16_t)p->buf[FRAME_OFF_SEQ] |
+                                   ((uint16_t)p->buf[FRAME_OFF_SEQ + 1U] << 8);
+                info.payload     = (info.payload_len > 0U)
+                                     ? &p->buf[FRAME_OFF_PAYLOAD]
+                                     : NULL;
 
-                if (geri_cagri != NULL)
+                if (handler != NULL)
                 {
-                    geri_cagri(&bilgi, kullanici);
+                    handler(&info, user_data);
                 }
 
-                /* Silme geri cagridan SONRA: payload tampona isaret ediyor */
-                tampondan_sil(p, paket_boyu);
+                /* Cikarma handler'dan SONRA: payload tampona isaret ediyor */
+                buf_consume(p, frame_len);
             }
-            else   /* COZ_HATALI */
+            else   /* PARSE_INVALID */
             {
-                tampondan_sil(p, 1U);         /* sadece bir bayt: yeniden tarama */
-                p->sayac_atilan_bayt++;
+                buf_consume(p, 1U);          /* sadece bir bayt: yeniden tarama */
+                p->bytes_dropped++;
             }
         }
     }
