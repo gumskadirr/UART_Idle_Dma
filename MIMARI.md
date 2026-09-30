@@ -375,9 +375,59 @@ Planın 11. bölümü bunu ister: yeniden başlatma sahibi task/döngüdür.
 3. **`frame_parser_discard`, `frame_parser_init` değil.** `init` sayaçları da
    sıfırlar ve her toparlanmada hata geçmişini siler. `discard` yalnızca
    bekleyen adayı atar, attığı baytları `bytes_dropped`'a ekler.
+4. **Yeniden başlatmadan önce hata bayrakları temizlenir.** Bu kural olmadan
+   tekrar denemek hiçbir şey değiştirmez; aşağıda ayrıca ele alınıyor.
 
 Toparlanmada `s_read_pos = 0` yapılır, çünkü DMA tamponun başından yeniden
-başlar. Sayaçlar: `restarts`, `restart_fails`.
+başlar.
+
+#### Bildirim ile borç ayrımı
+
+`s_rx_error` yalnızca **bildirimdir**; toparlanma **borcu** `s_recover_pending`
+içinde durur. Bayrağı temizleyip tek deneme yapıp geçmek ölümcüldü:
+
+- `HAL_UART_AbortReceive` DMAR ve IDLEIE'yi kapatır,
+- yeniden başlatma düşerse ikisi kapalı kalır,
+- kapalıyken **hiçbir callback oluşamaz**, yani bayrağı yeniden set edecek
+  kimse yoktur → RX kalıcı ölür, geride tek iz `restart_fails = 1`.
+
+Borç yalnızca üç durumda kapanır: alım gerçekten geri geldi, HAL zaten
+`BUSY_RX` (müdahale gereksiz), veya kalıcı hataya düşüldü.
+
+#### Sebebi temizlemeyen tekrar işe yaramaz
+
+En kritik satır budur:
+
+```c
+__HAL_UART_CLEAR_OREFLAG(s_huart);
+s_huart->ErrorCode = HAL_UART_ERROR_NONE;
+```
+
+`AbortReceive` hata bayraklarına dokunmaz. ORE duruyorsa
+`HAL_UARTEx_ReceiveToIdle_DMA`, EIE'yi açar açmaz hata kesmesi doğurur; HAL
+alımı iptal eder ve `HAL_ERROR` döner. HAL kaynağındaki not bunu açıkça yazar:
+*"In case of errors already pending when reception is started, interrupts may
+have already been raised and lead to reception abortion (overrun error for
+instance)."* Yani yeniden başlatma **tam da gerektiği anda** düşer. Sebebi
+temizlemeden 5 kez denemek 5 kez aynı sonucu verir.
+
+F4'te PE/FE/NE/ORE/IDLE tek yolla düşürülür: SR oku, DR oku. Beş makro
+(`__HAL_UART_CLEAR_PEFLAG` … `_IDLEFLAG`) birebir aynı şeyi yapar, bu yüzden
+tek çağrı yeterlidir.
+
+#### Sınırlı tekrar ve kalıcı hata durumu
+
+`UART_RX_RESTART_RETRY_MS = 5` denemeler arasına bekleme koyar; olmasa
+`while(1)` saniyede binlerce sonuçsuz abort/restart çifti çalıştırırdı.
+`UART_RX_RESTART_MAX_TRIES = 5` denemeden sonra `uart_rx_stats.faulted = 1`
+olur ve borç kapanır: daha fazla denemek anlamsız. Amaç **sessizce ölmek
+yerine görünür ölmek**. Tek çıkış yolu `uart_rx_start()`.
+
+`HAL_UART_AbortReceive` dönüşü de kontrol edilir: DMA abort'unu beklerken
+`HAL_TIMEOUT` dönebilir, o durumda periferik belirsiz haldedir ve devam etmek
+yanlış olur.
+
+Sayaçlar: `restarts`, `restart_fails`, `faulted`.
 
 ### 5.17 Zaman aşımı kararı ayrıştırıcıya ait değil
 
@@ -399,9 +449,34 @@ bozuk adayın içinde gerçek bir çerçeve başlamış olabilir.
 ~5,6 ms. 50 ms bunun ~9 katı; işletim sistemi kaynaklı parçalanmaya tolerans
 bırakır, tıkanmayı sınırlı tutar.
 
-Tetikleme koşulu "bekleyen aday var **ve** yeni bayt gelmiyor". Veri akmaya
-devam ederken tıkanma oluşamaz: tampon en fazla 64 bayta dolar ve orada CRC
-kararı verilir.
+#### Tetikleme koşulu "bildirim gelmedi" değil "tampon ilerlemedi"
+
+Bu ikisi aynı şey değildir ve karıştırmak geçerli veriyi bozar. **Bir yayın
+(burst) sürerken hiçbir bildirim oluşmaz:**
+
+- IDLE, son bayttan ~87 µs sonra gelir,
+- HT/TC yalnızca 128. ve 256. baytta tetiklenir.
+
+57 baytlık bir devam yayını 115200'de 4,95 ms sürer; o süre boyunca DMA
+tampona yazar ama `s_rx_pending` sıfırdır. Yalnızca zaman damgasına bakan bir
+kontrol, **akmakta olan geçerli bir çerçeveden bayt atar**. Bu yüzden karar
+verilmeden önce DMA'nın ilerleyip ilerlemediğine bakılır:
+
+```c
+if ((HAL_GetTick() - s_last_rx_tick) < UART_RX_FRAME_TIMEOUT_MS) return;
+
+if (dma_write_pos() != s_read_pos)   /* çerçeve hâlâ akıyor */
+{
+    uart_rx_drain();                 /* zaman aşımı yok: tüket */
+    return;
+}
+```
+
+Sıra önemlidir: süre kontrolü önce gelir, böylece normal işleyişte fazladan
+NDTR okuması yapılmaz.
+
+Bu düzeltmenin gerekliliği T4 testiyle ölçülerek gösterildi (bkz. 6. bölüm):
+düzeltme kapalıyken 64 baytlık geçerli bir çerçeve tamamen kayboluyor.
 
 ---
 
@@ -413,8 +488,8 @@ kararı verilir.
 |---|---|---|
 | CRC | 6 | Standart vektör `0x29B1`, boş girdi, tek bayt, protokol paketi |
 | Paketleyici | 9 | Referans baytlar, sınır kontrolleri, 12/13 bayt sınır testi |
-| Ayrıştırıcı | 12 | Bölünmüş, birleşik, çöplü, bozuk CRC, yarım, `AA 55` payload, kurtarma |
-| **Toplam** | **27** | `test_gecen == 27`, `test_kalan == 0` |
+| Ayrıştırıcı | 14 | Bölünmüş, birleşik, çöplü, bozuk CRC, yarım, `AA 55` payload, kurtarma, tıkanıklık + zaman aşımı (S13) |
+| **Toplam** | **29** | `test_gecen == 29`, `test_kalan == 0` |
 
 Sonuçlar `test_sonuc[]`, `test_gecen`, `test_kalan` üzerinden debugger'da
 okunur (`Live Expressions`).
@@ -424,29 +499,61 @@ okunur (`Live Expressions`).
 PA2–PA3 loopback, STM32F4DISCOVERY, ST-LINK üzerinden GDB ile okundu
 (30 Eylül 2026).
 
-| Ne | Ölçüm | Durum |
-|---|---|---|
-| Birim testleri | `test_gecen=29`, `test_kalan=0` | Doğrulandı |
-| DMA yazımı | `s_dma_buf` beklenen baytları taşıyor | Doğrulandı |
-| Uçtan uca alım | `joy_x=1000`, `joy_y=-500` | Doğrulandı |
-| Sarım | 40 çerçeve / 520 bayt → `frames_ok=40`, `last_seq=40`, `next_seq=41`, `seq_gaps=0` | Doğrulandı |
-| Okuma konumu | `s_read_pos=8` (520 mod 256) | Doğrulandı |
-| Ayrıştırıcı temizliği | `err_crc=0`, `err_len=0`, `err_version=0`, `bytes_dropped=0`, `len=0` | Doğrulandı |
-| HT/TC olayları | `ht_events=2`, `tc_events=2` (520 bayt için beklenen) | Doğrulandı |
-| IDLE olayı | `idle_events=40`, `last_size=8` | Doğrulandı |
-| **Bildirim yolu** | Loopback tüketimi yalnızca `uart_rx_service()` ile; 40 çerçevenin hepsi `callback → s_rx_pending → service` zincirinden geçti (`rx_events=44` = 40 IDLE + 2 HT + 2 TC) | Doğrulandı |
-| **Kısmi çerçeve zaman aşımı** | S13: bozuk `LENGTH` tıkanıklığı; `frame_parser_timeout` sonrası `frames_ok=1`, `timeouts=1`, `bytes_dropped=7`, `len=0`. Bağımsız Python referansıyla birebir aynı | Doğrulandı |
-| Hata yolu temiz | `error_events=0`, `restarts=0`, `restart_fails=0`, `frame_timeouts=0` | Doğrulandı |
+Loopback testleri birim testlerinden **ayrı** sayaçlar kullanır
+(`lb_gecen`, `lb_kalan`, `lb_sonuc[]`): birim testleri donanımsız koşar,
+bunlar jumper ve çalışan bir UART ister. İkisini aynı sayaçta toplamak
+"29 test geçti" ifadesinin anlamını bozardı.
 
-`son_size=8` ölçümü, 5.3'teki tespitin doğrudan kanıtıdır: 520 bayt alınmış
-olmasına rağmen `Size` **mutlak konumu** (8) bildiriyor, gelen bayt sayısını
-değil.
+| Test | Ne kanıtlar | Ölçüm |
+|---|---|---|
+| Birim testleri | Protokol mantığı, donanımsız | `test_gecen=29`, `test_kalan=0` |
+| T1 | Uçtan uca alım | `frames_ok=1`, `joy_x=1000`, `joy_y=-500` |
+| T2 | Sarım: 40 çerçeve / 520 bayt, tamponda iki tur | `frames_ok=40`, `last_seq=40`, `next_seq=41`, `seq_gaps=0`, `bytes_dropped=0`, `len=0` |
+| T3a | Bozuk `LENGTH` gerçekten tıkanıklık yaratıyor | `len=7` (64 bayt bekliyor) |
+| T3b | 50 ms sessizlikte zaman aşımı **kendiliğinden** ateşleniyor | `frame_timeouts=1`, `bytes_dropped` +7, `len=0` |
+| T4 | Sınırda akmakta olan geçerli çerçeve **düşmüyor** | `frames_ok` +1, `frame_timeouts` değişmedi, `last_seq=41`, `seq_gaps=0` |
+| T5a | `USART_CR1_SBK` ile **gerçek** framing error | `error_events=1`, `last_error=0x04` (FE) |
+| T5b | Hatadan sonra alım hâlâ çalışıyor | `restarts=1`, sonraki çerçeve çözüldü: `joy_x=-250`, `joy_y=750` |
+| T6a | 5 başarısız denemeden sonra kalıcı hata durumu | `restart_fails=5`, `faulted=1` |
+| T6b/c | `uart_rx_start()` kalıcı hatadan çıkarıyor ve alım geri geliyor | `faulted=0`, `frames_ok=1`, `joy_x=12`, `joy_y=-34` |
+| **Toplam** | | `lb_gecen=10`, `lb_kalan=0` |
+
+Olay sayaçları: `rx_events=49`, `idle_events=45`, `ht_events=2`,
+`tc_events=2`. T6 öncesi toplamlar: `lb_frames_ok=42`, `lb_last_seq=42`,
+`lb_seq_gaps=0`, `lb_bytes_dropped=7`.
+
+`last_size=8` ölçümü (T2 sonunda), 5.3'teki tespitin doğrudan kanıtıdır:
+520 bayt alınmış olmasına rağmen `Size` **mutlak konumu** bildiriyor, gelen
+bayt sayısını değil.
+
+#### T4 bir regresyon testidir: düşmesi de ölçüldü
+
+Bir testin geçmesi tek başına bir şey kanıtlamaz — hatayı yakalayıp
+yakalamadığı bilinmelidir. 5.17'deki `dma_write_pos()` kontrolü `#if 0` ile
+kapatılıp aynı ikili kartta koşuldu:
+
+| Ölçüm | Düzeltme açık | Düzeltme kapalı |
+|---|---|---|
+| `lb_sonuc[4]` (T4) | 1 = PASS | **2 = FAIL** |
+| `frame_timeouts` | 1 | **2** — yayının ortasında ateşlendi |
+| `lb_frames_ok` | 42 | **41** — 64 baytlık çerçeve kayboldu |
+| `lb_bytes_dropped` | 7 | **71** = 7 + 64, çerçevenin tamamı çöp olarak elendi |
+| `lb_seq_gaps` | 0 | **1** — SEQ 41 hiç gelmedi |
+
+T4'ün devam yayınını `HAL_UART_Transmit_DMA` ile göndermesi zorunludur:
+bloklayan `HAL_UART_Transmit` sırasında `uart_rx_service()` çağrılamaz ve hata
+görünmez kalır. Yani naif kurulmuş bir test bu hatayı yakalamaz.
 
 ### Doğrulanmamış olanlar
 
-- **Hata toparlanması gerçek bir UART hatasıyla sınanmadı.** Kod yolu var
-  (bkz. 5.16) ama loopback testinde hata oluşmadığı için `restarts = 0`.
-  Kasıtlı ORE/FE üretmek ayrı bir deney gerektirir.
+- **Kalıcı hata durumu yalnızca test kancasıyla sınandı.** T6, gerçek bir
+  donanım arızası değil `uart_rx_force_restart_fail()` kullanır; gerçek
+  donanımda yeniden başlatmanın düşmesini deterministik üretmenin temiz bir
+  yolu yok. Sınanan şey durum makinesi (tekrar aralığı, sınır, `faulted`,
+  tek çıkış yolu), HAL'in davranışı değil.
+- **ORE ile toparlanma sınanmadı.** T5 framing error üretir; taşma (ORE)
+  yolu, `__HAL_UART_CLEAR_OREFLAG` gerekçesinin asıl kaynağı olduğu hâlde
+  ölçülmedi. Bunun için okumayı kasıtlı geciktiren ayrı bir deney gerekir.
 - Sürekli tam hızlı trafik altında en kötü gecikme **ölçülmedi**
 - Kayıpsızlık iddia **edilemez**: taşma tespiti yok (bkz. 5.6)
 - PC'den gerçek veri ile test edilmedi; yalnızca loopback
@@ -481,7 +588,7 @@ olduğunu söyler.
 | 3 | Bare-metal bayrak yerine task bildirimi | M7 |
 | 4 | Taşma/kayıp tespiti | M9 — sayaç veya tur takibi (bkz. 5.6) |
 | 5 | TX yolu, komut yanıtı (`0x80`), tekrar ayıklama | M9 |
-| 6 | Hata toparlanmasının donanımda sınanması | Kasıtlı ORE/FE üreten ayrı deney |
+| 6 | ORE ile toparlanmanın sınanması | Okumayı kasıtlı geciktiren ayrı deney (FE yolu T5 ile doğrulandı) |
 | 7 | Joystick modu (`0x11`) davranışı, komut uygulama | M8 |
 | 8 | Ortak/ayrı sıra sayacı kararı | PC arayüzü ile birlikte (plan Adım 1) |
 

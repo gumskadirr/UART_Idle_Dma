@@ -22,6 +22,19 @@ uint8_t  test_kalan;
 uint16_t test_beklenen;
 uint16_t test_bulunan;
 
+/* Loopback (donanim) testleri icin ayri sayaclar */
+uint8_t  lb_sonuc[LB_SONUC_ADET];
+uint8_t  lb_sayisi;
+uint8_t  lb_gecen;
+uint8_t  lb_kalan;
+
+/* T6 uart_rx_start cagirdigi icin ayristirici sayaclari sifirlanir;
+   T6 oncesindeki degerler debugger'da gorunsun diye burada saklanir. */
+uint16_t lb_frames_ok;
+uint16_t lb_last_seq;
+uint16_t lb_seq_gaps;
+uint16_t lb_bytes_dropped;
+
 /* Ayristirici testlerinde bulunan cerceveleri biriktirir */
 typedef struct
 {
@@ -331,18 +344,77 @@ void birim_testleri_kosur(void)
 }
 
 
+/* --- Loopback (donanim) testleri ---
+   Birim testlerinden AYRI sayaclar kullanilir: birim testleri donanimsiz
+   kosar, bunlar PA2-PA3 jumper'i ve calisan bir UART ister. Ikisini ayni
+   sayacta toplamak "29 test gecti" ifadesinin anlamini bozardi. */
+
+static void lb_kaydet_bool(uint8_t dogru_mu)
+{
+  if (lb_sayisi >= LB_SONUC_ADET)
+  {
+    return;
+  }
+
+  if (dogru_mu != 0U)
+  {
+    lb_sonuc[lb_sayisi] = 1U;
+    lb_gecen++;
+  }
+  else
+  {
+    lb_sonuc[lb_sayisi] = 2U;
+    lb_kalan++;
+  }
+
+  lb_sayisi++;
+}
+
+
+/* Belirtilen sure boyunca service dondurur. Zaman asimi ve toparlanma
+   kararlari yalnizca service icinde verildigi icin testlerin "bekleme"
+   adimlari HAL_Delay DEGIL bu olmalidir. */
+static void service_dondur(uint32_t ms)
+{
+  uint32_t t0 = HAL_GetTick();
+
+  while ((HAL_GetTick() - t0) < ms)
+  {
+    uart_rx_service();
+  }
+}
+
+
 void loopback_testi_kosur(UART_HandleTypeDef *huart)
 {
+  /* T3: LENGTH=55 diyen bozuk baslik. 64 bayt bekler, devami hic gelmez. */
+  static const uint8_t t3_baslik[FRAME_HEADER_SIZE] =
+    {0xAA, 0x55, 0x01, 0x20, 0x37, 0x01, 0x00};
+
   uint8_t  tx[FRAME_MAX_SIZE];
+  uint8_t  payload[FRAME_MAX_PAYLOAD];
   uint8_t  n;
   uint16_t sira;
+  uint16_t i;
+  uint16_t bekleyen;
+  uint16_t ok_once;
+  uint16_t to_once;
+  uint16_t rf_once;
+  uint16_t err_once;
+  uint16_t drop_once;
+  uint32_t t0;
+
+  lb_sayisi = 0U;
+  lb_gecen  = 0U;
+  lb_kalan  = 0U;
 
   if (huart == NULL)
   {
     return;
   }
 
-  /* T1: tek paket. X = +1000, Y = -500, SEQUENCE = 1
+  /* ---------------- T1: tek cerceve ----------------
+     X = +1000, Y = -500, SEQUENCE = 1
      Beklenen 13 bayt: AA 55 01 10 04 01 00 E8 03 0C FE 46 59 */
   n = frame_build_joystick(tx, (uint8_t)sizeof(tx), 1000, -500, 1U);
   if (n == 0U)
@@ -361,17 +433,18 @@ void loopback_testi_kosur(UART_HandleTypeDef *huart)
   HAL_Delay(1U);
   uart_rx_service();
 
-  /* T2 - sarim testi: SEQUENCE 2..40 ile 39 paket daha.
-     Toplam 40 x 13 = 520 bayt; tampon 256 bayt oldugundan sarim iki kez
-     gerceklesir.
+  lb_kaydet_bool((uint8_t)((uart_rx_get_parser()->frames_ok == 1U) &&
+                           (uart_rx_state.last_seq == 1U) &&
+                           (uart_rx_state.joy_x == 1000) &&
+                           (uart_rx_state.joy_y == -500)));
+
+  /* ---------------- T2: sarim ----------------
+     SEQUENCE 2..40 ile 39 cerceve daha. Toplam 40 x 13 = 520 bayt; tampon
+     256 bayt oldugundan sarim iki kez gerceklesir.
 
      Her gonderimden sonra tuketmek ZORUNLU. Tuketmezsen yaklasik 20.
      cercevede DMA okunmamis veriyi ezmeye baslar ve konumlar esit gorunerek
-     kaybi gizler. Bu davranisi gormek icin asagidaki uart_rx_service()
-     cagrisini gecici olarak yorum satiri yapabilirsin.
-
-     Tuketim uart_rx_service() ile yapiliyor: bildirim yolu (callback ->
-     s_rx_pending -> service) de bu testin kapsaminda. */
+     kaybi gizler. */
   for (sira = 2U; sira <= 40U; sira++)
   {
     n = frame_build_joystick(tx, (uint8_t)sizeof(tx), 1000, -500, sira);
@@ -388,4 +461,197 @@ void loopback_testi_kosur(UART_HandleTypeDef *huart)
     HAL_Delay(1U);
     uart_rx_service();
   }
+
+  lb_kaydet_bool((uint8_t)((uart_rx_get_parser()->frames_ok == 40U) &&
+                           (uart_rx_state.last_seq == 40U) &&
+                           (uart_rx_state.next_seq == 41U) &&
+                           (uart_rx_state.seq_gaps == 0U) &&
+                           (uart_rx_get_parser()->len == 0U) &&
+                           (uart_rx_get_parser()->bytes_dropped == 0U)));
+
+  /* ---------------- T3: otomatik zaman asimi ----------------
+     S13 frame_parser_timeout() fonksiyonunu DOGRUDAN cagirir, yani
+     algoritmayi sinar. Burada sinanan sey kararin kendiliginden verilmesi:
+     gercek 50 ms sessizlik -> uart_rx_service -> check_frame_timeout. */
+  to_once   = uart_rx_stats.frame_timeouts;
+  drop_once = uart_rx_get_parser()->bytes_dropped;
+
+  if (HAL_UART_Transmit(huart, t3_baslik,
+                        (uint16_t)sizeof(t3_baslik), 100U) != HAL_OK)
+  {
+    return;
+  }
+
+  HAL_Delay(1U);
+  uart_rx_service();
+  bekleyen = uart_rx_get_parser()->len;      /* 7 bayt tikanmis olmali */
+
+  service_dondur(60U);                       /* 50 ms'de ateslenmeli */
+
+  lb_kaydet_bool((uint8_t)(bekleyen == FRAME_HEADER_SIZE));
+
+  /* Zaman asimi BIR bayt atar, yeniden tarama kalan 6 bayti eler:
+     55 01 20 37 01 00 hicbiri SYNC0 degil. Toplam 7. */
+  lb_kaydet_bool((uint8_t)((uart_rx_stats.frame_timeouts ==
+                            (uint16_t)(to_once + 1U)) &&
+                           (uart_rx_get_parser()->len == 0U) &&
+                           (uart_rx_get_parser()->bytes_dropped ==
+                            (uint16_t)(drop_once + FRAME_HEADER_SIZE))));
+
+  /* ---------------- T4: sinir testi (bulgu 2 regresyonu) ----------------
+     Zaman asimi siniri, AKMAKTA OLAN gecerli bir cercevenin ortasina duser.
+     Bir yayin surerken hicbir bildirim olusmaz (IDLE son bayttan ~87 us
+     sonra, HT/TC yalnizca 128./256. baytta), bu yuzden yalnizca zaman
+     damgasina bakan bir kontrol burada gecerli cerceveden bayt atar.
+
+     Devam yayini BLOKLAYAN Transmit ile gonderilemez: o sirada
+     uart_rx_service() cagrilamaz ve hata gorunmez kalir. Transmit_DMA
+     kullanildigi icin main dongusu serbest kalir. */
+  for (i = 0U; i < FRAME_MAX_PAYLOAD; i++)
+  {
+    payload[i] = (uint8_t)i;
+  }
+
+  n = frame_build(tx, (uint8_t)sizeof(tx), FRAME_TYPE_SET_OUTPUT, 41U,
+                  payload, FRAME_MAX_PAYLOAD);
+  if (n != FRAME_MAX_SIZE)                   /* 64 bayt beklenir */
+  {
+    return;
+  }
+
+  ok_once = uart_rx_get_parser()->frames_ok;
+  to_once = uart_rx_stats.frame_timeouts;
+
+  if (HAL_UART_Transmit(huart, tx, FRAME_HEADER_SIZE, 100U) != HAL_OK)
+  {
+    return;
+  }
+
+  HAL_Delay(1U);
+  uart_rx_service();                         /* aday olustu, tick simdi */
+
+  service_dondur(UART_RX_FRAME_TIMEOUT_MS - 3U);   /* sessizce sinira yaklas */
+
+  /* 57 bayt ~4,95 ms surer: 50 ms siniri yayinin ortasina duser */
+  if (HAL_UART_Transmit_DMA(huart, &tx[FRAME_HEADER_SIZE],
+                            (uint16_t)(n - FRAME_HEADER_SIZE)) != HAL_OK)
+  {
+    return;
+  }
+
+  /* Teslim olana kadar (veya 30 ms) service dondur */
+  t0 = HAL_GetTick();
+  while (((HAL_GetTick() - t0) < 30U) &&
+         (uart_rx_get_parser()->frames_ok == ok_once))
+  {
+    uart_rx_service();
+  }
+
+  lb_kaydet_bool((uint8_t)((uart_rx_get_parser()->frames_ok ==
+                            (uint16_t)(ok_once + 1U)) &&
+                           (uart_rx_stats.frame_timeouts == to_once) &&
+                           (uart_rx_state.last_seq == 41U) &&
+                           (uart_rx_state.seq_gaps == 0U)));
+
+  /* ---------------- T5: gercek UART hatasi ----------------
+     Yazilimdan ErrorCallback cagirmak hicbir sey kanitlamaz. USART_CR1_SBK
+     hatta bir break gonderir (baskin 0 bitleri); loopback'te alici bunu
+     framing error olarak gorur. FE'de HAL alimi kesmez, yalnizca
+     ErrorCallback cagirir; bu yuzden toparlanma BUSY_RX dalina girip
+     calisan alima DOKUNMAMALIDIR. */
+  err_once = uart_rx_stats.error_events;
+  ok_once  = uart_rx_get_parser()->frames_ok;
+
+  SET_BIT(huart->Instance->CR1, USART_CR1_SBK);
+  HAL_Delay(2U);
+  uart_rx_service();
+
+  lb_kaydet_bool((uint8_t)((uart_rx_stats.error_events > err_once) &&
+                           ((uart_rx_stats.last_error &
+                             HAL_UART_ERROR_FE) != 0U)));
+
+  /* ASIL IDDIA: hatadan sonra alim hala calisiyor. Break'in tampona
+     dusurdugu bayt SYNC0 olmadigi icin elenir. */
+  n = frame_build_joystick(tx, (uint8_t)sizeof(tx), -250, 750, 42U);
+  if (n == 0U)
+  {
+    return;
+  }
+
+  if (HAL_UART_Transmit(huart, tx, n, 100U) != HAL_OK)
+  {
+    return;
+  }
+
+  HAL_Delay(2U);
+  uart_rx_service();
+
+  lb_kaydet_bool((uint8_t)((uart_rx_get_parser()->frames_ok ==
+                            (uint16_t)(ok_once + 1U)) &&
+                           (uart_rx_state.last_seq == 42U) &&
+                           (uart_rx_state.joy_x == -250) &&
+                           (uart_rx_state.joy_y == 750)));
+
+  /* ---------------- T6: basarisiz yeniden baslatma ----------------
+     Gercek donanimda restart'in dusmesini deterministik uretmek mumkun
+     degil; test kancasi her denemeyi basarisiz saydirir. Sinanan sey:
+     borcun kapanmamasi, denemeler arasi bekleme, sinirda kalici hataya
+     gecis ve tek cikis yolunun uart_rx_start olmasi.
+
+     uart_rx_start ayristiriciyi sifirlayacagi icin onceki sayaclar
+     debugger'da gorunsun diye once saklaniyor. */
+  lb_frames_ok     = uart_rx_get_parser()->frames_ok;
+  lb_last_seq      = uart_rx_state.last_seq;
+  lb_seq_gaps      = uart_rx_state.seq_gaps;
+  lb_bytes_dropped = uart_rx_get_parser()->bytes_dropped;
+
+  rf_once = uart_rx_stats.restart_fails;
+
+  uart_rx_force_restart_fail(1U);
+  uart_rx_test_inject_error();
+
+  service_dondur(60U);            /* 5 deneme x 5 ms = ~25 ms; 60 bol */
+
+  uart_rx_force_restart_fail(0U);
+
+  lb_kaydet_bool((uint8_t)((uart_rx_stats.restart_fails ==
+                            (uint16_t)(rf_once +
+                                       UART_RX_RESTART_MAX_TRIES)) &&
+                           (uart_rx_stats.faulted == 1U)));
+
+  /* GERCEK bir kalici hatada RxState READY'dir: abort basarili olmus, yalnizca
+     ReceiveToIdle_DMA dusmustur. Test kancasi abort'u hic calistirmadigi icin
+     alim burada hala BUSY_RX ve uart_rx_start dogru sekilde HAL_BUSY doner.
+     Bu satir, kancanin atladigi onkosulu geri veriyor; uart_rx_start'in
+     calisan bir alimi sessizce yikmasini istemedigimiz icin duzeltme testte,
+     modulde degil. */
+  (void)HAL_UART_AbortReceive(huart);
+
+  /* Kalici hatadan tek cikis: yeniden kurmak */
+  if (uart_rx_start(huart) != HAL_OK)
+  {
+    return;
+  }
+
+  lb_kaydet_bool((uint8_t)(uart_rx_stats.faulted == 0U));
+
+  /* Alim gercekten geri geldi mi (ayristirici sifirlandi: frames_ok 1) */
+  n = frame_build_joystick(tx, (uint8_t)sizeof(tx), 12, -34, 43U);
+  if (n == 0U)
+  {
+    return;
+  }
+
+  if (HAL_UART_Transmit(huart, tx, n, 100U) != HAL_OK)
+  {
+    return;
+  }
+
+  HAL_Delay(2U);
+  uart_rx_service();
+
+  lb_kaydet_bool((uint8_t)((uart_rx_get_parser()->frames_ok == 1U) &&
+                           (uart_rx_state.last_seq == 43U) &&
+                           (uart_rx_state.joy_x == 12) &&
+                           (uart_rx_state.joy_y == -34)));
 }

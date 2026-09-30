@@ -1,12 +1,12 @@
 # Açık bulgular — RX hata toparlanması ve zaman aşımı
 
 Tarih: 30 Eylül 2026
-Durum: **Tespit edildi, düzeltilmedi.** Kod `f61673e` durumunda; bu belgedeki
-hiçbir değişiklik uygulanmadı.
+Durum: **KAPANDI.** Üç maddenin hepsi uygulandı ve kartta doğrulandı;
+T6 için A seçeneği (test kancası) uygulandı. Ölçümler en altta, "Sonuç"
+bölümünde. Belge, kararların neden böyle verildiğinin kaydı olarak duruyor.
 
 Bu üç madde, `090a04f` ile eklenen hata toparlanması ve kısmi çerçeve zaman
-aşımı kodunun incelemesinden çıktı. İşe dönerken bu belgeyi baştan okumak
-yeterli olmalı.
+aşımı kodunun incelemesinden çıktı.
 
 ---
 
@@ -132,27 +132,72 @@ Beklenen: `error_events >= 1`, `last_error & HAL_UART_ERROR_FE`, ve **asıl
 iddia** — sonrasında normal bir çerçeve gönderildiğinde `frames_ok` artıyor,
 yani alım hâlâ çalışıyor.
 
-### T6 — başarısız yeniden başlatma ve kalıcı hata durumu — KARAR BEKLİYOR
+### T6 — başarısız yeniden başlatma ve kalıcı hata durumu
 
-Başarısızlığı donanımdan deterministik üretmenin temiz bir yolu yok. İki
-seçenek:
+Başarısızlığı donanımdan deterministik üretmenin temiz bir yolu yoktu. İki
+seçenek vardı:
 
-- **A:** Modüle test amaçlı bir kanca (`uart_rx_force_restart_fail`) ekleyip
-  1c/1d durum makinesini sınamak. Dürüst, ama üretim modülüne test kodu girer.
+- **A (seçilen):** Modüle test amaçlı kanca (`uart_rx_force_restart_fail`,
+  `uart_rx_test_inject_error`) ekleyip 1c/1d durum makinesini sınamak.
 - **B:** T6'yı yazmamak; 1c/1d'yi "kod incelemesiyle doğrulandı, donanımda
-  sınanmadı" olarak `MIMARI.md` 6. bölüme yazmak.
+  sınanmadı" olarak belgelemek.
 
 ---
 
-## Sıra
+## Sonuç
 
-1. **2a/2b** — en küçük değişiklik, T4 onu doğruluyor
-2. **1a-1e** — toparlanma durum makinesi
-3. **T3 / T4 / T5** — karta at ve ölç
-4. **T6** — A/B kararı verildikten sonra
+Uygulama sırası: 2a/2b → 1a-1e → T3/T4/T5/T6. Hepsi kartta koştu
+(STM32F4DISCOVERY, PA2-PA3 loopback).
 
-Bunlar kapanmadan TX/RTOS yoluna girmek veya bu noktayı etiketlemek zayıf
-kalır: `090a04f` etiketsiz bırakıldı.
+```
+test_gecen = 29   test_kalan = 0          (birim testleri, donanimsiz)
+lb_gecen   = 10   lb_kalan   = 0          (loopback testleri)
+
+rx_events=49  idle_events=45  ht_events=2  tc_events=2
+error_events=1  last_error=0x04 (FE)
+restarts=1  restart_fails=5  faulted=0  frame_timeouts=1
+T6 oncesi: frames_ok=42  last_seq=42  seq_gaps=0  bytes_dropped=7
+```
+
+### Beklenmeyen ama değerli sonuç
+
+`restarts = 1`. T5'te break gönderildiğinde HAL alımı `BUSY_RX` durumunda
+**sürdürmedi**; gerçek toparlanma yolu (abort → bayrakları temizle →
+yeniden başlat) donanımda gerçekten çalıştı ve sonraki çerçeve sorunsuz
+çözüldü. Yani bulgu 1'in kodu artık varsayım değil, ölçülmüş.
+
+### T4'ün hatayı yakaladığı da ölçüldü
+
+Geçen bir test tek başına bir şey kanıtlamaz. 2b düzeltmesi `#if 0` ile
+kapatılıp aynı ikili tekrar koşuldu:
+
+| Ölçüm | Düzeltme açık | Düzeltme kapalı |
+|---|---|---|
+| `lb_sonuc[4]` (T4) | 1 = PASS | **2 = FAIL** |
+| `frame_timeouts` | 1 | **2** |
+| `lb_frames_ok` | 42 | **41** |
+| `lb_bytes_dropped` | 7 | **71** = 7 + 64 |
+| `lb_seq_gaps` | 0 | **1** |
+
+`71 = 7 + 64`: kaybedilen çerçevenin tamamı bayt bayt çöp olarak elendi.
+
+### Yol boyunca çıkan iki ders
+
+1. **`uart_rx_start()` çalışan bir alımın üzerine başlamaz.** T6 ilk koşuda
+   erken çıktı: kanca `AbortReceive`'i atladığı için RxState `BUSY_RX` kaldı
+   ve `ReceiveToIdle_DMA` doğru şekilde `HAL_BUSY` döndü. Gerçek bir kalıcı
+   hatada RxState `READY` olur (abort başarılı, restart başarısız), yani
+   düzeltme testte yapıldı, modülde değil — `uart_rx_start`'ın çalışan bir
+   alımı sessizce yıkması istenmez.
+2. **Zaman aşımında kontrol sırası:** süre dolmadan NDTR okumanın anlamı yok.
+   Önce süre, sonra ilerleme kontrolü.
+
+### Geriye kalan
+
+- ORE ile toparlanma hâlâ sınanmadı (T5 yalnızca FE üretir). `MIMARI.md`
+  8. bölüm madde 6.
+- Kalıcı hata durumu yalnızca test kancasıyla sınandı; HAL'in gerçek bir
+  arızada ne yapacağı ölçülmedi.
 
 ## İlgili belgeler
 

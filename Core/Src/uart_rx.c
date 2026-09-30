@@ -27,12 +27,22 @@ static volatile uint8_t    s_rx_pending;             /* kesme set eder */
 static volatile uint8_t    s_rx_error;               /* kesme set eder */
 static uint32_t            s_last_rx_tick;           /* son bayt geldigi an */
 
+/* Toparlanma borcu. s_rx_error yalnizca BILDIRIMDIR; borc burada durur ve
+   ancak alim gercekten geri geldiginde (ya da kalici hataya dusuldugunde)
+   kapanir. Yalnizca main baglaminda yazilir: volatile gerekmez. */
+static uint8_t             s_recover_pending;
+static uint8_t             s_restart_tries;          /* ust uste basarisizlik */
+static uint32_t            s_restart_tick;           /* son deneme ani */
+static uint8_t             s_force_restart_fail;     /* yalnizca test kancasi */
+
 uart_rx_stats_t uart_rx_stats;
 uart_rx_state_t uart_rx_state;
 
 static void frame_received(const frame_info_t *info, void *user_data);
 static void uart_rx_recover(void);
+static void restart_failed(void);
 static void check_frame_timeout(void);
+static uint16_t dma_write_pos(void);
 
 
 HAL_StatusTypeDef uart_rx_start(UART_HandleTypeDef *huart)
@@ -42,11 +52,16 @@ HAL_StatusTypeDef uart_rx_start(UART_HandleTypeDef *huart)
         return HAL_ERROR;
     }
 
-    s_huart        = huart;
-    s_read_pos     = 0U;
-    s_rx_pending   = 0U;
-    s_rx_error     = 0U;
-    s_last_rx_tick = HAL_GetTick();
+    s_huart           = huart;
+    s_read_pos        = 0U;
+    s_rx_pending      = 0U;
+    s_rx_error        = 0U;
+    s_last_rx_tick    = HAL_GetTick();
+    s_recover_pending = 0U;
+    s_restart_tries   = 0U;
+
+    /* Kalici hata durumundan tek cikis yolu burasi */
+    uart_rx_stats.faulted = 0U;
 
     frame_parser_init(&s_parser);
 
@@ -57,10 +72,20 @@ HAL_StatusTypeDef uart_rx_start(UART_HandleTypeDef *huart)
 
 void uart_rx_service(void)
 {
-    /* 1) Hata toparlamasi once: alim durmussa tuketmenin anlami yok */
+    /* 1) Hata toparlamasi once: alim durmussa tuketmenin anlami yok.
+       Kesmenin bildirimi burada BORCA cevrilir. Bayragi temizleyip tek
+       deneme yapip gecmek olumcul olurdu: deneme basarisiz olursa DMAR ve
+       IDLEIE kapali kalir, bir daha hicbir callback olusmaz ve bayragi set
+       edecek kimse kalmaz. Borc s_recover_pending'de durur. */
     if (s_rx_error != 0U)
     {
-        s_rx_error = 0U;
+        s_rx_error        = 0U;
+        s_recover_pending = 1U;
+        s_restart_tries   = 0U;          /* yeni hata: sayac bastan */
+    }
+
+    if (s_recover_pending != 0U)
+    {
         uart_rx_recover();
     }
 
@@ -82,19 +107,57 @@ static void uart_rx_recover(void)
 {
     if (s_huart == NULL)
     {
+        s_recover_pending = 0U;
+        return;
+    }
+
+    /* Basarisiz denemeler arasinda bekle. while(1) icinde bu kontrol olmasa
+       saniyede binlerce sonucsuz abort/restart cifti calisirdi. */
+    if ((s_restart_tries > 0U) &&
+        ((HAL_GetTick() - s_restart_tick) < UART_RX_RESTART_RETRY_MS))
+    {
+        return;
+    }
+
+    /* TEST KANCASI: donanima hic dokunmadan basarisiz deneme uretir.
+       BUSY_RX kontrolunden ONCE olmali, cunku testte alim calismaya devam
+       ediyor; amac tekrar/kalici hata mantigini sinamak. */
+    if (s_force_restart_fail != 0U)
+    {
+        restart_failed();
         return;
     }
 
     if (s_huart->RxState == HAL_UART_STATE_BUSY_RX)
     {
-        /* HAL alimi surduruyor (ornegin tek bir gurultu hatasi); mudahale
-           etmek calisan bir alimi bozar. */
+        /* HAL alimi surduruyor (ornegin tek bir gurultu hatasi: FE/NE/PE'de
+           HAL alimi kesmez, yalnizca ErrorCallback cagirir); mudahale etmek
+           calisan bir alimi bozar. Yapacak is yok, borc kapanir. */
+        s_recover_pending = 0U;
+        s_restart_tries   = 0U;
         return;
     }
 
     /* YALNIZCA RX iptal edilir. HAL_UART_Abort kullanilsaydi surmekte olan
-       bir TX de iptal olurdu; plan bolum 11 bunu acikca yasakliyor. */
-    (void)HAL_UART_AbortReceive(s_huart);
+       bir TX de iptal olurdu; plan bolum 11 bunu acikca yasakliyor.
+       Donus kontrol edilir: DMA abort'unu beklerken HAL_TIMEOUT donebilir,
+       o durumda periferik belirsiz haldedir ve devam etmek yanlis olur. */
+    if (HAL_UART_AbortReceive(s_huart) != HAL_OK)
+    {
+        restart_failed();
+        return;
+    }
+
+    /* Bekleyen hata bayraklari TEMIZLENMELI, yoksa tekrar denemek hicbir sey
+       degistirmez: AbortReceive bu bayraklara dokunmaz ve ORE duruyorsa
+       ReceiveToIdle_DMA, EIE'yi acar acmaz hata kesmesi dogurur; HAL alimi
+       iptal eder ve HAL_ERROR doner (HAL kaynagindaki "errors already
+       pending when reception is started" notu). Sebebi temizlemeden yapilan
+       tekrar, ayni sonucu tekrar uretmektir.
+       F4'te PE/FE/NE/ORE/IDLE tek yolla dusurulur: SR oku, DR oku. Bes
+       makronun hepsi ayni seyi yapar, bu yuzden bir cagri yeter. */
+    __HAL_UART_CLEAR_OREFLAG(s_huart);
+    s_huart->ErrorCode = HAL_UART_ERROR_NONE;
 
     /* Indeksler ve yarim cerceve durumu tutarli sekilde sifirlanir.
        frame_parser_init DEGIL frame_parser_discard: sayaclar korunmali,
@@ -107,20 +170,39 @@ static void uart_rx_recover(void)
                                      (uint16_t)sizeof(s_dma_buf)) == HAL_OK)
     {
         uart_rx_stats.restarts++;
+        s_recover_pending = 0U;          /* borc ancak burada kapanir */
+        s_restart_tries   = 0U;
     }
     else
     {
-        uart_rx_stats.restart_fails++;
+        restart_failed();
     }
 }
 
 
-/* Bekleyen aday, UART_RX_FRAME_TIMEOUT_MS boyunca yeni bayt gelmeden
+/* Basarisiz deneme muhasebesi. Sinir asilirsa alim GERCEKTEN durmustur;
+   bunu gizlemek yerine gorunur kilip borcu kapatiyoruz, cunku daha fazla
+   denemek anlamsiz. */
+static void restart_failed(void)
+{
+    uart_rx_stats.restart_fails++;
+    s_restart_tick = HAL_GetTick();
+    s_restart_tries++;
+
+    if (s_restart_tries >= UART_RX_RESTART_MAX_TRIES)
+    {
+        uart_rx_stats.faulted = 1U;
+        s_recover_pending     = 0U;
+    }
+}
+
+
+/* Bekleyen aday, UART_RX_FRAME_TIMEOUT_MS boyunca TAMPON ILERLEMEDEN
    duruyorsa dusurulur. Bozuk bir LENGTH alani arkasindaki gecerli cerceveyi
    sonsuza kadar bekletmesin. */
 static void check_frame_timeout(void)
 {
-    if (s_parser.len == 0U)
+    if ((s_huart == NULL) || (s_parser.len == 0U))
     {
         return;                      /* bekleyen aday yok */
     }
@@ -131,9 +213,41 @@ static void check_frame_timeout(void)
         return;
     }
 
+    /* Sure doldu, ama karar VERMEDEN once tamponun ilerleyip ilerlemedigine
+       bakilir. Kosul "bildirim gelmedi" DEGIL "tampon ilerlemedi"; ikisi ayni
+       sey degil, cunku bir yayin (burst) surerken hicbir bildirim olusmaz:
+       IDLE son bayttan ~87 us sonra gelir, HT/TC yalnizca 128./256. baytta
+       tetiklenir. 57 baytlik bir devam yayini 115200'de 4,95 ms surer ve bu
+       sure boyunca DMA yaziyor ama s_rx_pending sifirdir. Yalnizca zaman
+       damgasina baksak akmakta olan gecerli bir cerceveden bayt atardik.
+       Ilerlemis: cerceve hala geliyor -> zaman asimi yok, tuket.
+       uart_rx_drain zaman damgasini da yeniler. */
+    if (dma_write_pos() != s_read_pos)
+    {
+        uart_rx_drain();
+        return;
+    }
+
     frame_parser_timeout(&s_parser, frame_received, NULL);
     uart_rx_stats.frame_timeouts++;
     s_last_rx_tick = HAL_GetTick();
+}
+
+
+/* DMA'nin yazacagi SONRAKI konum. Saklanan bir durum degil, NDTR'den
+   turetilen anlik deger; bu yuzden her cagrida yeniden okunur.
+   Cagiran s_huart'in NULL olmadigini garanti etmelidir. */
+static uint16_t dma_write_pos(void)
+{
+    const uint16_t buf_size = (uint16_t)sizeof(s_dma_buf);
+
+    /* NDTR kalan transfer sayisini tutar ve her baytta azalir:
+          yazilan bayt sayisi = buf_size - NDTR
+       Modulo tek bir uc durum icin gerekli: DMA son bayti yazip NDTR'yi
+       henuz yeniden yuklemediginde 0 okunur, buf_size - 0 = buf_size cikar
+       ve bu gecersiz bir indekstir. Modulo onu 0'a cevirir. */
+    return (uint16_t)((buf_size -
+            (uint16_t)__HAL_DMA_GET_COUNTER(s_huart->hdmarx)) % buf_size);
 }
 
 
@@ -150,13 +264,7 @@ void uart_rx_drain(void)
 
     for (;;)
     {
-        /* NDTR kalan transfer sayisini tutar ve her baytta azalir:
-              yazilan bayt sayisi = buf_size - NDTR
-           Modulo tek bir uc durum icin gerekli: DMA son bayti yazip NDTR'yi
-           henuz yeniden yuklemediginde 0 okunur, buf_size - 0 = buf_size cikar
-           ve bu gecersiz bir indekstir. Modulo onu 0'a cevirir. */
-        write_pos = (uint16_t)((buf_size -
-                     (uint16_t)__HAL_DMA_GET_COUNTER(s_huart->hdmarx)) % buf_size);
+        write_pos = dma_write_pos();
 
         if (write_pos == s_read_pos)
         {
@@ -194,6 +302,20 @@ void uart_rx_drain(void)
 const frame_parser_t *uart_rx_get_parser(void)
 {
     return &s_parser;
+}
+
+
+/* --- Test kancalari (bkz. uart_rx.h) --- */
+
+void uart_rx_force_restart_fail(uint8_t enable)
+{
+    s_force_restart_fail = enable;
+}
+
+
+void uart_rx_test_inject_error(void)
+{
+    s_rx_error = 1U;
 }
 
 
