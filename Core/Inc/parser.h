@@ -37,6 +37,7 @@ typedef struct
     uint16_t err_len;               /* LENGTH sinir disi */
     uint16_t err_version;           /* VERSION uyusmadi */
     uint16_t bytes_dropped;         /* yeniden tarama sirasinda atilan bayt */
+    uint16_t timeouts;              /* zaman asimiyla dusurulen aday sayisi */
 } frame_parser_t;
 
 /* Yapiyi ilk kullanima hazirlar: len ve butun sayaclar sifirlanir.
@@ -48,5 +49,18 @@ void frame_parser_init(frame_parser_t *p);
 void frame_parser_feed(frame_parser_t *p,
                        const uint8_t *data, uint16_t len,
                        frame_handler_t handler, void *user_data);
+
+/* Bekleyen adayin zaman asimina dustugunu bildirir: adayin ilk bayti atilir
+   ve kalan veri yeniden taranir. Boylece bozuk bir LENGTH alani, arkasindaki
+   gecerli cerceveyi sonsuza kadar bekletemez.
+
+   Zaman asimi karari CAGIRANA aittir; bu modul saat bilmez ve bilmemelidir
+   (HAL/FreeRTOS bagimsizligi). Bekleyen aday yoksa hicbir sey yapmaz. */
+void frame_parser_timeout(frame_parser_t *p,
+                          frame_handler_t handler, void *user_data);
+
+/* Bekleyen adayi sayaclari KORUYARAK atar. Hata toparlamada kullanilir:
+   tampon durumu sifirlanmali ama istatistikler kaybolmamali. */
+void frame_parser_discard(frame_parser_t *p);
 
 #endif /* INC_PARSER_H_ */

@@ -36,6 +36,7 @@ void frame_parser_init(frame_parser_t *p)
     p->err_len       = 0U;
     p->err_version   = 0U;
     p->bytes_dropped = 0U;
+    p->timeouts      = 0U;
 }
 
 
@@ -137,13 +138,61 @@ static parse_result_t try_parse_frame(frame_parser_t *p, uint8_t *out_frame_len)
 }
 
 
+/* Tamponun basindan cozebildigi kadar cerceve cozer.
+   Dongu gerekli, cunku bir PARSE_INVALID zincirleme tetiklenebilir: bir bayt
+   cikarinca yeni aday hemen yeni bir karar uretebilir, yeni veri beklemeden. */
+static void run_decode_loop(frame_parser_t *p,
+                            frame_handler_t handler, void *user_data)
+{
+    uint8_t        frame_len;
+    parse_result_t result;
+
+    for (;;)
+    {
+        frame_len = 0U;
+        result = try_parse_frame(p, &frame_len);
+
+        if (result == PARSE_NEED_MORE)
+        {
+            break;
+        }
+
+        if (result == PARSE_OK)
+        {
+            frame_info_t info;
+
+            p->frames_ok++;
+
+            info.type        = p->buf[FRAME_OFF_TYPE];
+            info.payload_len = p->buf[FRAME_OFF_LENGTH];
+            info.seq         = (uint16_t)p->buf[FRAME_OFF_SEQ] |
+                               ((uint16_t)p->buf[FRAME_OFF_SEQ + 1U] << 8);
+            info.payload     = (info.payload_len > 0U)
+                                 ? &p->buf[FRAME_OFF_PAYLOAD]
+                                 : NULL;
+
+            if (handler != NULL)
+            {
+                handler(&info, user_data);
+            }
+
+            /* Cikarma handler'dan SONRA: payload tampona isaret ediyor */
+            buf_consume(p, frame_len);
+        }
+        else   /* PARSE_INVALID */
+        {
+            buf_consume(p, 1U);          /* sadece bir bayt: yeniden tarama */
+            p->bytes_dropped++;
+        }
+    }
+}
+
+
 void frame_parser_feed(frame_parser_t *p,
                        const uint8_t *data, uint16_t len,
                        frame_handler_t handler, void *user_data)
 {
-    uint16_t       i;
-    uint8_t        frame_len;
-    parse_result_t result;
+    uint16_t i;
 
     if ((p == NULL) || ((data == NULL) && (len > 0U)))
     {
@@ -163,46 +212,41 @@ void frame_parser_feed(frame_parser_t *p,
         p->buf[p->len] = data[i];
         p->len++;
 
-        /* Yeni bayt geldi: cozebildigimiz kadar coz. Dongu gerekli, cunku bir
-           PARSE_INVALID zincirleme tetiklenebilir: bir bayt cikarinca yeni
-           aday hemen yeni bir karar uretebilir, yeni veri beklemeden. */
-        for (;;)
-        {
-            frame_len = 0U;
-            result = try_parse_frame(p, &frame_len);
-
-            if (result == PARSE_NEED_MORE)
-            {
-                break;
-            }
-
-            if (result == PARSE_OK)
-            {
-                frame_info_t info;
-
-                p->frames_ok++;
-
-                info.type        = p->buf[FRAME_OFF_TYPE];
-                info.payload_len = p->buf[FRAME_OFF_LENGTH];
-                info.seq         = (uint16_t)p->buf[FRAME_OFF_SEQ] |
-                                   ((uint16_t)p->buf[FRAME_OFF_SEQ + 1U] << 8);
-                info.payload     = (info.payload_len > 0U)
-                                     ? &p->buf[FRAME_OFF_PAYLOAD]
-                                     : NULL;
-
-                if (handler != NULL)
-                {
-                    handler(&info, user_data);
-                }
-
-                /* Cikarma handler'dan SONRA: payload tampona isaret ediyor */
-                buf_consume(p, frame_len);
-            }
-            else   /* PARSE_INVALID */
-            {
-                buf_consume(p, 1U);          /* sadece bir bayt: yeniden tarama */
-                p->bytes_dropped++;
-            }
-        }
+        /* Yeni bayt geldi: cozebildigimiz kadar coz */
+        run_decode_loop(p, handler, user_data);
     }
+}
+
+
+void frame_parser_timeout(frame_parser_t *p,
+                          frame_handler_t handler, void *user_data)
+{
+    if ((p == NULL) || (p->len == 0U))
+    {
+        return;                      /* bekleyen aday yok */
+    }
+
+    p->timeouts++;
+
+    /* Bir bayt at: bekleyen aday gecersiz sayiliyor. Tamponu bosaltmiyoruz,
+       cunku adayin ICINDE gercek bir cerceve baslamis olabilir. Asagidaki
+       dongu bunu hemen bulur. */
+    buf_consume(p, 1U);
+    p->bytes_dropped++;
+
+    run_decode_loop(p, handler, user_data);
+}
+
+
+void frame_parser_discard(frame_parser_t *p)
+{
+    if (p == NULL)
+    {
+        return;
+    }
+
+    /* Atilan baytlar sayaca yazilir: hata toparlamada ne kaybettigimiz
+       gorunur kalmali. */
+    p->bytes_dropped = (uint16_t)(p->bytes_dropped + p->len);
+    p->len = 0U;
 }

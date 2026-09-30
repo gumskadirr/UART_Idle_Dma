@@ -24,11 +24,15 @@ static uint8_t             s_dma_buf[UART_RX_BUF_SIZE];
 static uint16_t            s_read_pos;               /* okunmamis ilk bayt */
 static frame_parser_t      s_parser;                 /* yarim cerceve durumu */
 static volatile uint8_t    s_rx_pending;             /* kesme set eder */
+static volatile uint8_t    s_rx_error;               /* kesme set eder */
+static uint32_t            s_last_rx_tick;           /* son bayt geldigi an */
 
 uart_rx_stats_t uart_rx_stats;
 uart_rx_state_t uart_rx_state;
 
 static void frame_received(const frame_info_t *info, void *user_data);
+static void uart_rx_recover(void);
+static void check_frame_timeout(void);
 
 
 HAL_StatusTypeDef uart_rx_start(UART_HandleTypeDef *huart)
@@ -38,9 +42,11 @@ HAL_StatusTypeDef uart_rx_start(UART_HandleTypeDef *huart)
         return HAL_ERROR;
     }
 
-    s_huart      = huart;
-    s_read_pos   = 0U;
-    s_rx_pending = 0U;
+    s_huart        = huart;
+    s_read_pos     = 0U;
+    s_rx_pending   = 0U;
+    s_rx_error     = 0U;
+    s_last_rx_tick = HAL_GetTick();
 
     frame_parser_init(&s_parser);
 
@@ -51,11 +57,83 @@ HAL_StatusTypeDef uart_rx_start(UART_HandleTypeDef *huart)
 
 void uart_rx_service(void)
 {
+    /* 1) Hata toparlamasi once: alim durmussa tuketmenin anlami yok */
+    if (s_rx_error != 0U)
+    {
+        s_rx_error = 0U;
+        uart_rx_recover();
+    }
+
+    /* 2) Bekleyen veriyi tuket */
     if (s_rx_pending != 0U)
     {
         s_rx_pending = 0U;
         uart_rx_drain();
     }
+
+    /* 3) Yarim cerceve cok uzun suredir bekliyorsa dusur */
+    check_frame_timeout();
+}
+
+
+/* UART hatasindan kontrollu toparlanma. Kesme icinde DEGIL burada yapilir:
+   yeniden baslatma sahibi tuketici baglamdir (plan bolum 11). */
+static void uart_rx_recover(void)
+{
+    if (s_huart == NULL)
+    {
+        return;
+    }
+
+    if (s_huart->RxState == HAL_UART_STATE_BUSY_RX)
+    {
+        /* HAL alimi surduruyor (ornegin tek bir gurultu hatasi); mudahale
+           etmek calisan bir alimi bozar. */
+        return;
+    }
+
+    /* YALNIZCA RX iptal edilir. HAL_UART_Abort kullanilsaydi surmekte olan
+       bir TX de iptal olurdu; plan bolum 11 bunu acikca yasakliyor. */
+    (void)HAL_UART_AbortReceive(s_huart);
+
+    /* Indeksler ve yarim cerceve durumu tutarli sekilde sifirlanir.
+       frame_parser_init DEGIL frame_parser_discard: sayaclar korunmali,
+       yoksa hata gecmisi her toparlanmada silinir. */
+    frame_parser_discard(&s_parser);
+    s_read_pos     = 0U;
+    s_last_rx_tick = HAL_GetTick();
+
+    if (HAL_UARTEx_ReceiveToIdle_DMA(s_huart, s_dma_buf,
+                                     (uint16_t)sizeof(s_dma_buf)) == HAL_OK)
+    {
+        uart_rx_stats.restarts++;
+    }
+    else
+    {
+        uart_rx_stats.restart_fails++;
+    }
+}
+
+
+/* Bekleyen aday, UART_RX_FRAME_TIMEOUT_MS boyunca yeni bayt gelmeden
+   duruyorsa dusurulur. Bozuk bir LENGTH alani arkasindaki gecerli cerceveyi
+   sonsuza kadar bekletmesin. */
+static void check_frame_timeout(void)
+{
+    if (s_parser.len == 0U)
+    {
+        return;                      /* bekleyen aday yok */
+    }
+
+    /* uint32_t cikarma sarimda da dogru sonuc verir */
+    if ((HAL_GetTick() - s_last_rx_tick) < UART_RX_FRAME_TIMEOUT_MS)
+    {
+        return;
+    }
+
+    frame_parser_timeout(&s_parser, frame_received, NULL);
+    uart_rx_stats.frame_timeouts++;
+    s_last_rx_tick = HAL_GetTick();
 }
 
 
@@ -88,6 +166,9 @@ void uart_rx_drain(void)
                zamaninda tuketmektir (256 bayt / 11520 bayt/s ~ 22 ms). */
             break;
         }
+
+        /* Yeni bayt geldi: zaman asimi sayaci bastan baslar */
+        s_last_rx_tick = HAL_GetTick();
 
         if (write_pos > s_read_pos)
         {
@@ -203,5 +284,9 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     {
         uart_rx_stats.error_events++;
         uart_rx_stats.last_error = huart->ErrorCode;
+
+        /* Toparlanma burada YAPILMAZ: kesme baglaminda HAL'i yeniden
+           baslatmak yerine tuketici baglamina bildirilir. */
+        s_rx_error = 1U;
     }
 }

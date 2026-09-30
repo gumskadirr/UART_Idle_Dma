@@ -18,6 +18,12 @@
 
 #define UART_RX_BUF_SIZE   256U
 
+/* Bekleyen yarim cerceve icin tamamlama zaman asimi.
+   En buyuk cerceve 64 bayt; 115200 8N1'de 64 x 86,8 us ~ 5,6 ms. 50 ms bunun
+   ~9 katidir: isletim sistemi kaynakli parcalanma ve gecikmelere tolerans
+   birakir, buna karsilik tikanmayi sinirli tutar. */
+#define UART_RX_FRAME_TIMEOUT_MS   50U
+
 /* Alim olay sayaclari. Kesme icinde yazilip main baglaminda okundugu icin
    volatile: derleyici bu degerleri register'da onbellekleyemez. */
 typedef struct
@@ -29,6 +35,11 @@ typedef struct
     volatile uint16_t last_size;      /* callback'in bildirdigi Size (MUTLAK KONUM) */
     volatile uint16_t error_events;   /* UART hata callback sayisi */
     volatile uint32_t last_error;     /* ORE/FE/NE/PE bit maskesi */
+
+    /* Asagidakiler yalnizca main baglaminda yazilir: volatile gerekmez */
+    uint16_t restarts;                /* kontrollu yeniden baslatma sayisi */
+    uint16_t restart_fails;           /* yeniden baslatma basarisiz oldu */
+    uint16_t frame_timeouts;          /* zaman asimiyla dusurulen aday sayisi */
 } uart_rx_stats_t;
 
 /* Cozulmus cercevelerden turetilen durum. Yalnizca main baglaminda

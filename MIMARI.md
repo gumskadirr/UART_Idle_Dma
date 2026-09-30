@@ -38,7 +38,7 @@ paket_geldi()         sıra takibi, X/Y çözümü
 
 Her katman yalnızca altındakinin çıktısını görür. `parser.c` UART, DMA veya
 dairesel tampon nedir bilmez; girdisi düz bir bayt dizisidir. Bu, M4'te yazılan
-27 birim testinin donanım olmadan koşabilmesinin ve M5–M6'da `parser.c`'ye tek
+29 birim testinin donanım olmadan koşabilmesinin ve M5–M6'da `parser.c`'ye tek
 satır dokunulmamasının sebebidir.
 
 ---
@@ -101,7 +101,7 @@ TYPE 0x20, payload {AA,55}, SEQ=300     →  11 bayt, CRC 0x8F8D
 | `Core/Src/frame.c` | Çerçeve **oluşturma** (gönderme yönü) | `crc16` |
 | `Core/Src/parser.c` | Çerçeve **ayrıştırma** (alma yönü) | `crc16`, `frame.h` (sabitler) |
 | `Core/Src/uart_rx.c` | DMA tamponu, okuma konumu, HAL callback'leri, uygulama durumu | HAL, `parser`, `frame` |
-| `Core/Src/tests.c` | 27 birim testi + loopback testi | tümü |
+| `Core/Src/tests.c` | 29 birim testi + loopback testi | tümü |
 | `Core/Src/main.c` | Yalnızca CubeMX kurulumu + `uart_rx_start` / `uart_rx_service` | `uart_rx`, `tests` |
 | `tools/protokol.py` | Bağımsız referans uygulaması | Python 3 |
 
@@ -360,6 +360,49 @@ başladığı bilinemez). `sira_baslatildi` bayrağı ilk paketi referans olarak
 tarafı tür başına ayrı sayaç kullanırsa bu mantık yanlış kayıp raporlar; planın
 1. adımında netleştirilecek açık bir karardır.
 
+### 5.16 Hata toparlanması kesme içinde yapılmaz
+
+`HAL_UART_ErrorCallback` yalnızca sayaç artırır ve `s_rx_error` bayrağını
+kaldırır. Toparlanma `uart_rx_service()` içinde, tüketici bağlamında yapılır.
+Planın 11. bölümü bunu ister: yeniden başlatma sahibi task/döngüdür.
+
+Üç kural:
+
+1. **`HAL_UART_AbortReceive`, `HAL_UART_Abort` değil.** İkincisi sürmekte olan
+   bir TX'i de iptal ederdi; plan bunu açıkça yasaklıyor.
+2. **`RxState == HAL_UART_STATE_BUSY_RX` ise dokunulmaz.** Tek bir gürültü
+   hatasında HAL alımı sürdürür; müdahale çalışan bir alımı bozar.
+3. **`frame_parser_discard`, `frame_parser_init` değil.** `init` sayaçları da
+   sıfırlar ve her toparlanmada hata geçmişini siler. `discard` yalnızca
+   bekleyen adayı atar, attığı baytları `bytes_dropped`'a ekler.
+
+Toparlanmada `s_read_pos = 0` yapılır, çünkü DMA tamponun başından yeniden
+başlar. Sayaçlar: `restarts`, `restart_fails`.
+
+### 5.17 Zaman aşımı kararı ayrıştırıcıya ait değil
+
+`parser.c` saat bilmez ve bilmemelidir — HAL/FreeRTOS bağımsızlığı 29 birim
+testinin donanımsız koşabilmesinin sebebi. Bu yüzden sorumluluk ayrılmıştır:
+
+```c
+/* parser.h — kararı ÇAĞIRAN verir */
+void frame_parser_timeout(frame_parser_t *p, frame_handler_t handler, void *user_data);
+
+/* uart_rx.c — saati olan taraf */
+if ((HAL_GetTick() - s_last_rx_tick) >= UART_RX_FRAME_TIMEOUT_MS) { ... }
+```
+
+Zaman aşımı tamponu **boşaltmaz, bir bayt atar** — 5.9'daki aynı gerekçe:
+bozuk adayın içinde gerçek bir çerçeve başlamış olabilir.
+
+`UART_RX_FRAME_TIMEOUT_MS = 50`: en büyük çerçeve 64 bayt, 115200 8N1'de
+~5,6 ms. 50 ms bunun ~9 katı; işletim sistemi kaynaklı parçalanmaya tolerans
+bırakır, tıkanmayı sınırlı tutar.
+
+Tetikleme koşulu "bekleyen aday var **ve** yeni bayt gelmiyor". Veri akmaya
+devam ederken tıkanma oluşamaz: tampon en fazla 64 bayta dolar ve orada CRC
+kararı verilir.
+
 ---
 
 ## 6. Doğrulama durumu
@@ -383,14 +426,17 @@ PA2–PA3 loopback, STM32F4DISCOVERY, ST-LINK üzerinden GDB ile okundu
 
 | Ne | Ölçüm | Durum |
 |---|---|---|
-| Birim testleri | `test_gecen=27`, `test_kalan=0` | Doğrulandı |
-| DMA yazımı | `RxData` beklenen baytları taşıyor | Doğrulandı |
-| Uçtan uca alım | `son_x=1000`, `son_y=-500` | Doğrulandı |
-| Sarım | 40 çerçeve / 520 bayt → `frames_ok=40`, `last_seq=40`, `seq_gaps=0` | Doğrulandı |
-| Okuma konumu | `read_pos=8` (520 mod 256) | Doğrulandı |
-| Ayrıştırıcı temizliği | `crc_hata=0`, `atilan_bayt=0`, `yazilan=0` | Doğrulandı |
-| HT/TC olayları | `ht_sayaci=2`, `tc_sayaci=2` (520 bayt için beklenen) | Doğrulandı |
-| IDLE olayı | `idle_sayaci=1`, `son_size=8` | Doğrulandı |
+| Birim testleri | `test_gecen=29`, `test_kalan=0` | Doğrulandı |
+| DMA yazımı | `s_dma_buf` beklenen baytları taşıyor | Doğrulandı |
+| Uçtan uca alım | `joy_x=1000`, `joy_y=-500` | Doğrulandı |
+| Sarım | 40 çerçeve / 520 bayt → `frames_ok=40`, `last_seq=40`, `next_seq=41`, `seq_gaps=0` | Doğrulandı |
+| Okuma konumu | `s_read_pos=8` (520 mod 256) | Doğrulandı |
+| Ayrıştırıcı temizliği | `err_crc=0`, `err_len=0`, `err_version=0`, `bytes_dropped=0`, `len=0` | Doğrulandı |
+| HT/TC olayları | `ht_events=2`, `tc_events=2` (520 bayt için beklenen) | Doğrulandı |
+| IDLE olayı | `idle_events=40`, `last_size=8` | Doğrulandı |
+| **Bildirim yolu** | Loopback tüketimi yalnızca `uart_rx_service()` ile; 40 çerçevenin hepsi `callback → s_rx_pending → service` zincirinden geçti (`rx_events=44` = 40 IDLE + 2 HT + 2 TC) | Doğrulandı |
+| **Kısmi çerçeve zaman aşımı** | S13: bozuk `LENGTH` tıkanıklığı; `frame_parser_timeout` sonrası `frames_ok=1`, `timeouts=1`, `bytes_dropped=7`, `len=0`. Bağımsız Python referansıyla birebir aynı | Doğrulandı |
+| Hata yolu temiz | `error_events=0`, `restarts=0`, `restart_fails=0`, `frame_timeouts=0` | Doğrulandı |
 
 `son_size=8` ölçümü, 5.3'teki tespitin doğrudan kanıtıdır: 520 bayt alınmış
 olmasına rağmen `Size` **mutlak konumu** (8) bildiriyor, gelen bayt sayısını
@@ -398,10 +444,9 @@ değil.
 
 ### Doğrulanmamış olanlar
 
-- **Kesme güdümlü tüketim yolu sınanmadı.** T2 testinde `uart_rx_drain()` gönderim
-  döngüsü içinden **eşzamanlı** çağrılıyor; 40 paketi teslim eden yol bu.
-  `while(1)` içindeki `s_rx_pending` yolunun bağlı olduğu doğrulandı (IDLE
-  tetikleniyor, bayrak kalkıyor) ama testin sonucu ona dayanmıyor.
+- **Hata toparlanması gerçek bir UART hatasıyla sınanmadı.** Kod yolu var
+  (bkz. 5.16) ama loopback testinde hata oluşmadığı için `restarts = 0`.
+  Kasıtlı ORE/FE üretmek ayrı bir deney gerektirir.
 - Sürekli tam hızlı trafik altında en kötü gecikme **ölçülmedi**
 - Kayıpsızlık iddia **edilemez**: taşma tespiti yok (bkz. 5.6)
 - PC'den gerçek veri ile test edilmedi; yalnızca loopback
@@ -434,9 +479,9 @@ olduğunu söyler.
 | 1 | USART2 ve DMA kesme önceliği `0` | M7 — FreeRTOS `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY` kuralı |
 | 2 | `NVIC_PRIORITYGROUP_0` | M7 — Cortex-M4 + FreeRTOS için `PRIORITYGROUP_4` |
 | 3 | Bare-metal bayrak yerine task bildirimi | M7 |
-| 4 | Kısmi paket zaman aşımı | M9 — yarım paket sonsuza kadar tamponda bekliyor |
-| 5 | Taşma/kayıp tespiti | M9 — sayaç veya tur takibi |
-| 6 | TX yolu, komut yanıtı (`0x80`), tekrar ayıklama | M9 |
+| 4 | Taşma/kayıp tespiti | M9 — sayaç veya tur takibi (bkz. 5.6) |
+| 5 | TX yolu, komut yanıtı (`0x80`), tekrar ayıklama | M9 |
+| 6 | Hata toparlanmasının donanımda sınanması | Kasıtlı ORE/FE üreten ayrı deney |
 | 7 | Joystick modu (`0x11`) davranışı, komut uygulama | M8 |
 | 8 | Ortak/ayrı sıra sayacı kararı | PC arayüzü ile birlikte (plan Adım 1) |
 

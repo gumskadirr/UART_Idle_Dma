@@ -199,6 +199,13 @@ static void frame_parser_testleri_kosur(void)
   static const uint8_t s_yarim[8] =
     {0xAA,0x55,0x01,0x10,0x04,0x01,0x00,0xE8};
 
+  /* S13: LENGTH=55 diyen bir baslik (64 bayt bekler) + arkasinda gecerli
+     cerceve. Toplam 20 bayt geldigi icin aday asla tamamlanmaz ve arkadaki
+     gecerli cerceve de bekler. Zaman asimi bu tikanikligi acar. */
+  static const uint8_t s_tikanik[20] =
+    {0xAA,0x55,0x01,0x20,0x37,0x01,0x00,
+     0xAA,0x55,0x01,0x10,0x04,0x01,0x00,0xE8,0x03,0x0C,0xFE,0x46,0x59};
+
   frame_parser_t    p;
   collector_t t;
   uint8_t     i;
@@ -290,6 +297,25 @@ static void frame_parser_testleri_kosur(void)
   frame_parser_feed(&p, s_yarim, (uint16_t)sizeof(s_yarim), frame_collector, &t);
   test_kaydet_bool((uint8_t)((t.adet == 0U) && (p.frames_ok == 0U) &&
                              (p.err_crc == 0U)));
+
+  /* S13: bozuk LENGTH tikanikligi ve zaman asimiyla acilmasi.
+     Once beslemede hicbir cerceve teslim edilmemeli (aday 64 bayt bekliyor,
+     elde 20 var). Sonra zaman asimi bir bayt atar, yeniden tarama arkadaki
+     gecerli cerceveyi bulur. */
+  frame_parser_init(&p);
+  memset(&t, 0, sizeof(t));
+  frame_parser_feed(&p, s_tikanik, (uint16_t)sizeof(s_tikanik),
+                    frame_collector, &t);
+  test_kaydet_bool((uint8_t)((t.adet == 0U) && (p.len == 20U)));
+
+  frame_parser_timeout(&p, frame_collector, &t);
+  test_kaydet_bool((uint8_t)((t.adet == 1U) &&
+                             (t.turler[0] == FRAME_TYPE_JOYSTICK) &&
+                             (t.siralar[0] == 1U) &&
+                             (t.son_x == 1000) && (t.son_y == -500) &&
+                             (p.timeouts == 1U) &&
+                             (p.bytes_dropped == 7U) &&
+                             (p.len == 0U)));
 }
 
 
@@ -329,16 +355,23 @@ void loopback_testi_kosur(UART_HandleTypeDef *huart)
     return;
   }
 
-  uart_rx_drain();
+  /* uart_rx_drain() DEGIL uart_rx_service(): boylece
+     callback -> s_rx_pending -> service zinciri de sinanir. IDLE son bayttan
+     ~87 us sonra tetiklendigi icin 1 ms beklemek yeterli. */
+  HAL_Delay(1U);
+  uart_rx_service();
 
   /* T2 - sarim testi: SEQUENCE 2..40 ile 39 paket daha.
      Toplam 40 x 13 = 520 bayt; tampon 256 bayt oldugundan sarim iki kez
      gerceklesir.
 
      Her gonderimden sonra tuketmek ZORUNLU. Tuketmezsen yaklasik 20.
-     pakette DMA okunmamis veriyi ezmeye baslar ve konumlar esit gorunerek
-     kaybi gizler. Bu davranisi gormek icin asagidaki uart_rx_drain()
-     cagrisini gecici olarak yorum satiri yapabilirsin. */
+     cercevede DMA okunmamis veriyi ezmeye baslar ve konumlar esit gorunerek
+     kaybi gizler. Bu davranisi gormek icin asagidaki uart_rx_service()
+     cagrisini gecici olarak yorum satiri yapabilirsin.
+
+     Tuketim uart_rx_service() ile yapiliyor: bildirim yolu (callback ->
+     s_rx_pending -> service) de bu testin kapsaminda. */
   for (sira = 2U; sira <= 40U; sira++)
   {
     n = frame_build_joystick(tx, (uint8_t)sizeof(tx), 1000, -500, sira);
@@ -352,6 +385,7 @@ void loopback_testi_kosur(UART_HandleTypeDef *huart)
       return;
     }
 
-    uart_rx_drain();
+    HAL_Delay(1U);
+    uart_rx_service();
   }
 }
